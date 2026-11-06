@@ -1,4 +1,5 @@
-name: Build Windows EXE
+
+name: Build Small Windows EXE
 
 on:
   workflow_dispatch:
@@ -19,18 +20,24 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Build Standalone EXE
+      - name: Restore Dependencies
+        run: dotnet restore MySwitcher.csproj
+
+      - name: Publish Small EXE
         run: |
           dotnet publish MySwitcher.csproj `
             -c Release `
             -r win-x64 `
-            --self-contained true `
+            --self-contained false `
             -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:IncludeNativeLibrariesForSelfExtract=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
             -o publish
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: MySwitcher-Windows-x64
-          path: publish/
+          name: AppSwitcher-Small-Windows
+          path: publish/AppSwitcher.exe
+          if-no-files-found: error
