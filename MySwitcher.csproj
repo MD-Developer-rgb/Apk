@@ -7,27 +7,29 @@
 
     <UseWindowsForms>true</UseWindowsForms>
 
-    <!-- Explicit usings and no nullable annotations -->
+    <!-- C# settings -->
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
     <LangVersion>latest</LangVersion>
 
-    <!-- Application name -->
+    <!-- Application identity -->
     <AssemblyName>AppSwitcher</AssemblyName>
     <RootNamespace>AppSwitcherTool</RootNamespace>
 
-    <!-- Windows 10 / 11 -->
+    <!-- Windows compatibility -->
     <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
 
-    <!-- Single standalone EXE -->
+    <!-- Small single-file EXE -->
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
 
+    <!-- Release settings -->
     <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
 </Project>
