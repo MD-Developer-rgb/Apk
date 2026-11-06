@@ -697,7 +697,7 @@ namespace AppSwitcherTool
         {
             Dock = DockStyle.Fill,
             IntegralHeight = false,
-            HorizontalScrollBar = true,
+            HorizontalScrollbar = true,
             BorderStyle = BorderStyle.FixedSingle
         };
         private readonly List<AppEntry> _items = new List<AppEntry>();
@@ -820,7 +820,7 @@ namespace AppSwitcherTool
         {
             Dock = DockStyle.Fill,
             IntegralHeight = false,
-            HorizontalScrollBar = true,
+            HorizontalScrollbar = true,
             BorderStyle = BorderStyle.FixedSingle
         };
         private readonly TextBox _input = new TextBox { Dock = DockStyle.Top };
