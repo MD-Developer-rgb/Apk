@@ -8,7 +8,15 @@
 //      /define:DASHBOARD_BUILD      -> "PCWatch.exe" : dashboard + background host
 //
 //  PCWatch.exe also runs as the hidden background host ("--background") that owns
-//  the Python server and ngrok processes, and as the uninstaller ("--uninstall").
+//  the Python server and the Microsoft Dev Tunnel (devtunnel.exe), and as the uninstaller ("--uninstall").
+//
+//  Tunnel: Microsoft Dev Tunnels CLI only (https://aka.ms/TunnelsCliDownload/win-x64), stored in Tools\devtunnel.exe.
+//
+//  BUILD (Developer Command Prompt or C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe):
+//    csc /nologo /target:winexe /optimize+ /platform:anycpu /out:setup.exe /resource:PCWatch.cs,PCWatch.cs
+//        /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Security.dll
+//        /r:System.Web.Extensions.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll PCWatch.cs
+//    (put it all on one line)
 //
 //  NOTE: the compiler that ships with Windows (csc.exe v4.0.30319) only supports
 //  C# 5. This file deliberately uses C# 5 syntax only and is pure ASCII.
@@ -100,7 +108,6 @@ namespace PCWatch
         public static string SourceDir { get { return Sub("Source"); } }
         public static string ExePath { get { return Sub("PCWatch.exe"); } }
         public static string SettingsFile { get { return Path.Combine(ConfigDir, "settings.ini"); } }
-        public static string TokenFile { get { return Path.Combine(ConfigDir, "ngrok.token.dat"); } }
         public static string KeyFile { get { return Path.Combine(ConfigDir, "localkey.dat"); } }
         public static string DefaultLogDir { get { return Sub("Logs"); } }
     }
@@ -175,9 +182,11 @@ namespace PCWatch
             d["log_retention_days"] = "14";
             d["log_dir"] = "";
             d["python_path"] = "";
-            d["ngrok_path"] = "";
-            d["ngrok_domain"] = "";
-            d["tunnel_port"] = "0";           // 0 = follow server port
+            d["devtunnel_path"] = "";         // Microsoft Dev Tunnels CLI (Tools\devtunnel.exe)
+            d["tunnel_autostart"] = "0";      // start the tunnel whenever the background host starts
+            d["tunnel_stop_on_exit"] = "0";   // stop only the tunnel when the dashboard closes
+            d["tunnel_anonymous"] = "0";      // 0 = private tunnel (default). 1 = anyone with the link (warned everywhere)
+            d["tunnel_retry_limit"] = "5";    // automatic restarts after a crash (0 = never)
             d["theme"] = "Dark";
             d["allow_screen"] = "0";
             d["allow_camera"] = "0";
@@ -212,6 +221,7 @@ namespace PCWatch
                 var d = Defaults();
                 foreach (var kv in Ini.Read(Paths.SettingsFile)) d[kv.Key] = kv.Value;
                 foreach (var kv in changes) d[kv.Key] = kv.Value;
+                foreach (string legacy in new[] { "ngrok_path", "ngrok_domain", "tunnel_port" }) d.Remove(legacy);   // keys of the removed ngrok tunnel
                 Ini.Write(Paths.SettingsFile, d);
                 cache = null;
             }
@@ -230,7 +240,7 @@ namespace PCWatch
         public static string OverrideDir;   // used by the installer before settings exist
         static readonly Regex Rx = new Regex(@"(?i)\b(authtoken|token|password|passwd|secret|cookie|authorization)\b(""?\s*[:=]\s*""?)[^\s,;""]+", RegexOptions.Compiled);
 
-        public static string[] AllFiles = { "application.log", "server.log", "server-process.log", "ngrok.log", "install.log", "auth.log", "connections.log" };
+        public static string[] AllFiles = { "application.log", "server.log", "server-process.log", "tunnel.log", "install.log", "auth.log", "connections.log" };
 
         public static string Dir
         {
@@ -247,7 +257,7 @@ namespace PCWatch
             {
                 case "server": return "server.log";
                 case "serverproc": return "server-process.log";
-                case "ngrok": return "ngrok.log";
+                case "tunnel": return "tunnel.log";
                 case "installation": return "install.log";
                 case "authentication": return "auth.log";
                 case "connections": return "connections.log";
@@ -260,7 +270,7 @@ namespace PCWatch
             {
                 case "serverproc": return "Server";
                 case "server": return "Server";
-                case "ngrok": return "ngrok";
+                case "tunnel": return "Tunnel";
                 case "installation": return "Installation";
                 case "authentication": return "Authentication";
                 case "connections": return "Connections";
@@ -701,7 +711,7 @@ namespace PCWatch
     }
 
     // ========================================================================
-    //  BACKGROUND HOST: owns the Python server and ngrok processes.
+    //  BACKGROUND HOST: owns the Python server and the Microsoft Dev Tunnel process.
     //  Runs as "PCWatch.exe --background" (no window, tray icon only).
     // ========================================================================
     internal abstract class ManagedProcess
@@ -724,6 +734,10 @@ namespace PCWatch
         protected virtual void GracefulStop() { }
         protected virtual void OnLine(string line, bool isErr) { }
         protected virtual string FatalMessage(int code) { return null; }
+        protected virtual int MaxRestarts { get { return 5; } }          // automatic restarts allowed within 10 minutes (0 = never)
+        protected virtual void OnAdopted() { }
+        protected bool prepWait;                          // set by Prepare() when it needs time (for example a download) instead of failing
+        protected virtual void PollPrepare() { SetState("Stopped", ""); }
         protected virtual string LineLevel(string line, bool isErr) { return isErr ? "ERROR" : "INFO"; }
         string PidFile { get { return Path.Combine(Paths.RunDir, Name + ".pid"); } }
 
@@ -749,6 +763,7 @@ namespace PCWatch
             {
                 case "Stopped": if (!TryAdopt()) Start(); break;
                 case "Restarting": if (DateTime.UtcNow >= nextRetry) Start(); break;
+                case "Preparing": PollPrepare(); break;
                 case "Error": break;   // waits for an explicit Start/Restart from the user
                 default:
                     if (P == null || P.HasExited) { HandleExit(); break; }
@@ -767,7 +782,7 @@ namespace PCWatch
                 Process p = ProcTools.Get(pid);
                 if (p == null || !ProcTools.SamePath(ProcTools.PathOf(pid), ExpectedExe) ||
                     Math.Abs(p.StartTime.ToUniversalTime().Ticks - ticks) > 50000000L) { File.Delete(PidFile); return false; }
-                P = p; Pid = pid; StartedUtc = p.StartTime.ToUniversalTime(); startedAt = DateTime.UtcNow;
+                P = p; Pid = pid; StartedUtc = p.StartTime.ToUniversalTime(); startedAt = DateTime.UtcNow; OnAdopted();
                 Log.Info("Application", Name + ": adopted the already-running PC Watch process (pid " + pid + ")");
                 SetState("Starting", "");
                 return true;
@@ -778,7 +793,8 @@ namespace PCWatch
         void Start()
         {
             string err; ProcessStartInfo psi;
-            if (!Prepare(out err, out psi)) { SetState("Error", err); return; }
+            prepWait = false;
+            if (!Prepare(out err, out psi)) { SetState(prepWait ? "Preparing" : "Error", err); prepWait = false; return; }
             try
             {
                 psi.UseShellExecute = false; psi.CreateNoWindow = true;
@@ -813,9 +829,14 @@ namespace PCWatch
             string fatal = FatalMessage(code);
             if (fatal != null) { SetState("Error", fatal); return; }
             DateTime now = DateTime.UtcNow;
-            crashes.Add(now); crashes.RemoveAll(delegate(DateTime t) { return (now - t).TotalMinutes > 5; });
+            crashes.Add(now); crashes.RemoveAll(delegate(DateTime t) { return (now - t).TotalMinutes > 10; });
             string why = Name + " exited (code " + code + ")" + (lastErr.Length > 0 ? ": " + lastErr : "");
-            if (crashes.Count >= 5) { SetState("Error", Name + " keeps crashing. Last problem: " + why); return; }
+            if (crashes.Count > MaxRestarts)
+            {
+                SetState("Error", MaxRestarts == 0 ? Name + " stopped unexpectedly and automatic restart is turned off. Last problem: " + why
+                                                   : Name + " keeps crashing (more than " + MaxRestarts + " restarts in 10 minutes). Last problem: " + why);
+                return;
+            }
             nextRetry = now.AddSeconds(backoff); backoff = Math.Min(30, backoff * 2);
             SetState("Restarting", why);
         }
@@ -893,112 +914,278 @@ namespace PCWatch
         }
     }
 
-    // ---- ngrok tunnel ---------------------------------------------------------
+    // ---- Microsoft Dev Tunnels (devtunnel.exe) -----------------------------------
+    // Commands used (verified against learn.microsoft.com/azure/developer/dev-tunnels/cli-commands):
+    //   devtunnel --version | devtunnel user show | devtunnel user login [-g] [-d] | devtunnel user logout
+    //   devtunnel host -p PORT --protocol http [--allow-anonymous]      (temporary tunnel, private by default)
+    internal enum DtAuth { Unknown, SignedIn, SignedOut }
+
+    internal static class DevTunnelCli
+    {
+        public static string Exe { get { return Settings.Get("devtunnel_path"); } }
+        static readonly Regex Negative = new Regex(@"(?i)\b(not|no|never)\b[^.\r\n]{0,15}\b(logged|signed)\s*in\b|logged\s*out|signed\s*out|expired");
+        static readonly Regex Positive = new Regex(@"(?i)\b(logged|signed)\s*in\b");
+
+        public static string FirstLine(string o)
+        {
+            foreach (string l in (o ?? "").Split('\n')) { string t = l.Trim(); if (t.Length > 0) return t.Length > 200 ? t.Substring(0, 200) : t; }
+            return "";
+        }
+        // Microsoft documents `devtunnel user show` but not its wording. Result is SignedIn only when the text clearly
+        // says so; otherwise Unknown, and the raw CLI line is shown to the user. Nothing is assumed.
+        public static DtAuth UserShow(out string line)
+        {
+            string o; int c = ProcTools.Run(Exe, "user show", 20000, out o);
+            line = FirstLine(o);
+            if (c == -1) { line = "devtunnel did not answer within 20 seconds"; return DtAuth.Unknown; }
+            if (c == -2) { line = "devtunnel could not be started: " + line; return DtAuth.Unknown; }
+            if (Negative.IsMatch(o)) return DtAuth.SignedOut;
+            if (c == 0 && Positive.IsMatch(o)) return DtAuth.SignedIn;
+            return DtAuth.Unknown;
+        }
+        public static bool GetVersion(string exe, out string ver)
+        {
+            ver = ""; if (string.IsNullOrEmpty(exe) || !File.Exists(exe)) return false;
+            string o; int c = ProcTools.Run(exe, "--version", 25000, out o);
+            ver = FirstLine(o); return c == 0 && ver.Length > 0;
+        }
+    }
+
+    // Finds, downloads and verifies the official Microsoft Dev Tunnels CLI. Used by setup/repair AND by the background host,
+    // so a missing devtunnel.exe is fetched automatically the first time the tunnel is started.
+    // Source (Microsoft Learn, "Dev tunnels: Get started"): https://aka.ms/TunnelsCliDownload/win-x64  (Windows x64)
+    internal static class DevTunnelSetup
+    {
+        public const string DownloadUrl = "https://aka.ms/TunnelsCliDownload/win-x64";
+        static readonly object Gate = new object();
+        public static string DefaultExe { get { return Path.Combine(Paths.ToolsDir, "devtunnel.exe"); } }
+
+        // Configured path first, then Tools\devtunnel.exe. A copy elsewhere on the PATH is deliberately NOT used:
+        // PC Watch keeps its own verified copy inside its own folder.
+        public static string Find(out string ver)
+        {
+            ver = "";
+            foreach (string c in new[] { Settings.Get("devtunnel_path"), DefaultExe })
+                if (!string.IsNullOrEmpty(c) && File.Exists(c) && DevTunnelCli.GetVersion(c, out ver)) return c;
+            return null;
+        }
+
+        // Downloads to a temporary file, verifies it (size, PE header, Microsoft Authenticode signature, runs --version),
+        // and only then moves it to Tools\devtunnel.exe. Throws InstallException with a plain explanation on any failure.
+        public static string Install(Action<int> pct, Action<string> say, out string ver)
+        {
+            lock (Gate)
+            {
+                ver = "";
+                string found = Find(out ver);
+                if (found != null) { Settings.Set("devtunnel_path", found); return found; }
+                if (!Environment.Is64BitOperatingSystem)
+                    throw new InstallException("The Microsoft Dev Tunnels CLI download is for 64-bit Windows only.", "Use Windows 10 or 11 x64, or place a devtunnel.exe you trust in " + Paths.ToolsDir + " and set its path in Settings.");
+                Directory.CreateDirectory(Paths.ToolsDir);
+                string exe = DefaultExe, part = Path.Combine(Paths.ToolsDir, "devtunnel.download.exe");
+                try { if (File.Exists(part)) File.Delete(part); } catch { }
+                say("Downloading the Microsoft Dev Tunnels CLI from " + DownloadUrl + " ...");
+                try { Deps.Download(DownloadUrl, part, pct); }
+                catch (Exception ex)
+                {
+                    try { if (File.Exists(part)) File.Delete(part); } catch { }
+                    throw new InstallException("The Dev Tunnels CLI download failed: " + ex.Message, "Check the internet connection (and any proxy or firewall that blocks aka.ms / Microsoft download servers), then try again.");
+                }
+                say("Verifying the downloaded file...");
+                try
+                {
+                    var fi = new FileInfo(part);
+                    if (fi.Length < 1048576) throw new InstallException("The downloaded file is too small to be devtunnel.exe (" + fi.Length + " bytes).", "The download was probably interrupted or replaced by an error page. Try again on a trusted network.");
+                    var head = new byte[2];
+                    using (var fs = File.OpenRead(part)) { if (fs.Read(head, 0, 2) != 2 || head[0] != (byte)'M' || head[1] != (byte)'Z') throw new InstallException("The downloaded file is not a Windows program.", "Try again on a trusted network."); }
+                    string subj, status = Deps.Signature(part, out subj);
+                    Log.Info("Installation", "devtunnel signature: " + status + " " + subj);
+                    if (status != "Valid" || subj.IndexOf("Microsoft Corporation", StringComparison.OrdinalIgnoreCase) < 0)
+                        throw new InstallException("The downloaded devtunnel.exe failed the Microsoft signature check (" + status + ").", "The file may be corrupted or intercepted, so it was NOT used. Try again on a trusted network.");
+                    string v; if (!DevTunnelCli.GetVersion(part, out v)) throw new InstallException("The downloaded devtunnel.exe is signed by Microsoft but does not run.", "Check whether antivirus software blocked or quarantined it, then try again.");
+                }
+                catch { try { if (File.Exists(part)) File.Delete(part); } catch { } throw; }
+                for (int i = 0; ; i++)
+                {
+                    try { if (File.Exists(exe)) File.Delete(exe); File.Move(part, exe); break; }
+                    catch (IOException) { if (i >= 9) { try { File.Delete(part); } catch { } throw new InstallException("devtunnel.exe is locked by another program.", "Stop the tunnel / close other copies of devtunnel and try again."); } Thread.Sleep(500); }
+                }
+                if (!DevTunnelCli.GetVersion(exe, out ver)) throw new InstallException("devtunnel.exe was installed but does not run.", "Check antivirus quarantine for " + exe + ".");
+                Settings.Set("devtunnel_path", exe);
+                Log.Info("Installation", "Microsoft Dev Tunnels CLI " + ver + " ready at " + exe);
+                return exe;
+            }
+        }
+    }
+
+    // Sends Ctrl+C to a console-less child (devtunnel deletes its temporary tunnel when it receives it)
+    internal static class ConsoleCtrl
+    {
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)] static extern bool FreeConsole();
+        [DllImport("kernel32.dll")] static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+        [DllImport("kernel32.dll")] static extern bool GenerateConsoleCtrlEvent(uint evt, uint group);
+        static readonly object L = new object();
+        public static bool SendCtrlC(int pid)
+        {
+            lock (L)
+            {
+                bool ok = false;
+                try
+                {
+                    FreeConsole();
+                    if (AttachConsole((uint)pid))
+                    {
+                        SetConsoleCtrlHandler(IntPtr.Zero, true);   // this process ignores the event it is about to send
+                        ok = GenerateConsoleCtrlEvent(0, 0);
+                        Thread.Sleep(200);
+                        FreeConsole();
+                        SetConsoleCtrlHandler(IntPtr.Zero, false);
+                    }
+                }
+                catch { }
+                return ok;
+            }
+        }
+    }
+
     internal sealed class TunnelProc : ManagedProcess
     {
-        public const int ApiPort = 47040;
-        public volatile string Url = "";
-        volatile string pendingFatal;
-        DateTime reconnectSince = DateTime.MinValue;
+        public volatile string Url = "", TunnelId = "", AuthState = "unknown";
+        volatile string pendingFatal, dlError; volatile bool pendingAuth, ready, adoptedNoState, dlRunning; volatile int dlPct;
+        DateTime urlSeenAt = DateTime.MinValue;
+        static readonly Regex UrlRx = new Regex(@"https://[A-Za-z0-9._~-]+(:\d+)?/?", RegexOptions.Compiled);
+        static readonly Regex ReadyRx = new Regex(@"Ready to accept connections for tunnel:\s*(\S+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        static readonly Regex AuthRx = new Regex(@"(?i)(not\s+(logged|signed)\s*in|(log|sign)\s*in\s+(is\s+)?required|unauthori[sz]ed|authentication\s+(failed|required)|token\s+(has\s+)?expired|\b401\b|\b403\b)", RegexOptions.Compiled);
+
         public TunnelProc() { Name = "tunnel"; }
-        protected override string Cat { get { return "ngrok"; } }
-        protected override string ExpectedExe { get { return Settings.Get("ngrok_path"); } }
+        protected override string Cat { get { return "tunnel"; } }
+        protected override string ExpectedExe { get { return DevTunnelCli.Exe; } }
+        protected override int MaxRestarts { get { return Math.Max(0, Math.Min(20, Settings.GetInt("tunnel_retry_limit", 5))); } }
+        static int LocalPort { get { return Settings.GetInt("server_port", 8765); } }   // always the PC Watch server port: nothing else is ever forwarded
+        static string StateFile { get { return Path.Combine(Paths.RunDir, "tunnel.state"); } }
 
         protected override bool Prepare(out string error, out ProcessStartInfo psi)
         {
-            psi = null; error = ""; pendingFatal = null; Url = "";
-            string exe = Settings.Get("ngrok_path");
-            if (!File.Exists(exe)) { error = "ngrok was not found at '" + exe + "'. Run Repair (About page) or set the ngrok path in Settings."; return false; }
-            string token = Secrets.Load(Paths.TokenFile);
-            if (string.IsNullOrEmpty(token)) { error = "No ngrok authtoken is configured. Open Tunnel > 'Set authtoken' and paste the token from dashboard.ngrok.com."; return false; }
-            Log.AddSecret(token);
-            if (PortTools.InUse(ApiPort)) { error = "Local port " + ApiPort + " (ngrok status interface) is in use by another program."; return false; }
-            int port = Settings.GetInt("tunnel_port", 0); if (port <= 0) port = Settings.GetInt("server_port", 8765);
-            string cfg = Path.Combine(Paths.ConfigDir, "ngrok.yml");
-            File.WriteAllText(cfg, "version: \"3\"\r\nagent:\r\n  web_addr: 127.0.0.1:" + ApiPort + "\r\n");
-            string dom = Settings.Get("ngrok_domain").Trim();
-            string args = "http 127.0.0.1:" + port + " --config \"" + cfg + "\" --log stdout --log-format json --inspect=false";
-            if (dom.Length > 0 && Regex.IsMatch(dom, @"^[A-Za-z0-9.-]+$")) args += " --url https://" + dom;
-            psi = new ProcessStartInfo(exe, args);
+            psi = null; error = ""; pendingFatal = null; pendingAuth = false; ready = false; adoptedNoState = false; Url = ""; TunnelId = "";
+            try { if (File.Exists(StateFile)) File.Delete(StateFile); } catch { }
+            string exe = DevTunnelCli.Exe;
+            if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
+            {
+                string fv, found = DevTunnelSetup.Find(out fv);
+                if (found != null) { Settings.Set("devtunnel_path", found); exe = found; }
+                else
+                {
+                    // devtunnel.exe is missing: download + verify it in the background (the host and the UI stay responsive)
+                    if (!dlRunning)
+                    {
+                        dlRunning = true; dlError = null; dlPct = 0;
+                        var th = new Thread(delegate()
+                        {
+                            try { string v; DevTunnelSetup.Install(delegate(int p) { dlPct = p; }, delegate(string m) { Log.Info("tunnel", m); }, out v); }
+                            catch (InstallException ie) { dlError = ie.Message + " " + ie.Help; Log.Error("tunnel", "Dev Tunnels CLI download failed: " + ie.Message); }
+                            catch (Exception ex) { dlError = ex.Message; Log.Error("tunnel", "Dev Tunnels CLI download failed: " + ex.Message); }
+                            finally { dlRunning = false; }
+                        });
+                        th.IsBackground = true; th.Name = "devtunnel download"; th.Start();
+                    }
+                    prepWait = true; error = "Downloading the Microsoft Dev Tunnels CLI..."; return false;
+                }
+            }
+            string line; DtAuth a = DevTunnelCli.UserShow(out line);
+            if (a == DtAuth.SignedOut) { AuthState = "required"; error = "Sign-in required: Dev Tunnels is not signed in (CLI: " + line + "). Open the Tunnel page and press Sign in."; return false; }
+            AuthState = a == DtAuth.SignedIn ? "ok" : "unknown";
+            if (a == DtAuth.Unknown) Log.Warn("Application", "Could not confirm the Dev Tunnels sign-in (CLI said: " + line + "). Trying to host anyway.");
+            int port = LocalPort;
+            bool anon = Settings.GetBool("tunnel_anonymous");
+            if (anon) Log.Warn("Application", "SECURITY WARNING: this Dev Tunnel allows ANONYMOUS access - anyone with the link can reach the PC Watch login page.");
+            psi = new ProcessStartInfo(exe, "host -p " + port + " --protocol http" + (anon ? " --allow-anonymous" : ""));
             psi.WorkingDirectory = Paths.ToolsDir;
-            psi.EnvironmentVariables["NGROK_AUTHTOKEN"] = token;   // never put the token on the command line
             return true;
         }
 
-        protected override string LineLevel(string line, bool isErr)
+        protected override void PollPrepare()
         {
-            if (line.Contains("\"lvl\":\"eror\"") || line.Contains("\"lvl\":\"crit\"")) return "ERROR";
-            if (line.Contains("\"lvl\":\"warn\"")) return "WARNING";
-            if (line.Contains("\"lvl\":\"dbug\"")) return "DEBUG";
-            return isErr ? "ERROR" : "INFO";
+            if (dlRunning) { SetState("Preparing", "Downloading the Microsoft Dev Tunnels CLI... " + dlPct + "%"); return; }
+            string e = dlError;
+            if (e != null) { dlError = null; SetState("Error", "Could not download the Microsoft Dev Tunnels CLI: " + e); return; }
+            SetState("Stopped", "");   // download finished: the next supervisor cycle starts the tunnel normally
         }
 
         protected override void OnLine(string line, bool isErr)
         {
-            if (line.Contains("ERR_NGROK_105") || line.Contains("ERR_NGROK_106") || line.Contains("ERR_NGROK_107") || line.Contains("authentication failed"))
-                pendingFatal = "ngrok rejected the authtoken (invalid or revoked). Use Tunnel > 'Set authtoken' with a fresh token from dashboard.ngrok.com.";
-            else if (line.Contains("ERR_NGROK_108"))
-                pendingFatal = "Your ngrok account already has another agent session online (free plans allow one). Stop the other ngrok agent or upgrade the plan.";
-            else if (line.Contains("ERR_NGROK_334"))
-                pendingFatal = "The reserved ngrok domain is already online elsewhere. Stop the other tunnel using that domain.";
+            if (line.Trim().Length == 0) return;
+            Match m = ReadyRx.Match(line);
+            if (m.Success) { TunnelId = m.Groups[1].Value.Trim(); ready = true; SaveState(); return; }
+            if (line.IndexOf("Hosting port", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                // "Hosting port 8765 at https://<id>.<cluster>.devtunnels.ms:8765/, https://<id>-8765.<cluster>.devtunnels.ms/ and inspect it at https://..."
+                string head = line; int ins = head.IndexOf("inspect", StringComparison.OrdinalIgnoreCase);
+                if (ins > 0) head = head.Substring(0, ins);          // never publish the inspection URL
+                string best = null;
+                foreach (Match u in UrlRx.Matches(head))
+                {
+                    string v = u.Value.TrimEnd(',', '.');
+                    if (best == null) best = v;
+                    if (v.IndexOf("-" + LocalPort + ".", StringComparison.Ordinal) >= 0) { best = v; break; }   // the per-port https URL
+                }
+                if (best != null && best != Url) { Url = best; urlSeenAt = DateTime.UtcNow; SaveState(); }
+                return;
+            }
+            lastErr = line.Length > 300 ? line.Substring(0, 300) : line;
+            if (AuthRx.IsMatch(line) && !ready) pendingAuth = true;
+        }
+
+        void SaveState() { try { int pid = Pid; if (pid > 0) File.WriteAllText(StateFile, pid + "|" + Url + "|" + TunnelId + "|" + (ready ? "1" : "0")); } catch { } }
+
+        protected override void OnAdopted()
+        {
+            // an already-running devtunnel of ours: its console output is gone, so recover the URL from the state file
+            adoptedNoState = true;
+            try
+            {
+                string[] a = File.ReadAllText(StateFile).Trim().Split('|');
+                if (a.Length == 4 && a[0] == Pid.ToString() && a[1].StartsWith("https://")) { Url = a[1]; TunnelId = a[2]; ready = a[3] == "1"; urlSeenAt = DateTime.UtcNow; adoptedNoState = false; }
+            }
+            catch { }
+        }
+
+        protected override string FatalMessage(int code)
+        {
+            if (pendingAuth) { AuthState = "required"; return "Sign-in required or expired (devtunnel said: " + lastErr + "). Open the Tunnel page and press Sign in."; }
+            return null;
         }
 
         protected override void GracefulStop()
         {
-            try
-            {
-                string t; int c = Http.Send("GET", "http://127.0.0.1:" + ApiPort + "/api/tunnels", null, null, 1500, true, out t);
-                var d = c == 200 ? Json.Obj(t) : null;
-                if (d != null && d.ContainsKey("tunnels"))
-                {
-                    var arr = d["tunnels"] as System.Collections.IEnumerable;
-                    if (arr != null) foreach (object o in arr)
-                    {
-                        string n = Json.Str(o as Dictionary<string, object>, "name");
-                        if (n.Length > 0) { string x; Http.Send("DELETE", "http://127.0.0.1:" + ApiPort + "/api/tunnels/" + Uri.EscapeDataString(n), null, null, 2000, true, out x); }
-                    }
-                }
-            }
-            catch { }
-            Thread.Sleep(400);
-            if (P != null && !P.HasExited) ProcTools.KillTree(Pid);   // ngrok has no console to signal; the API call above closes tunnels cleanly first
-        }
-
-        string QueryUrl()
-        {
-            string t; int c = Http.Send("GET", "http://127.0.0.1:" + ApiPort + "/api/tunnels", null, null, 1500, true, out t);
-            if (c != 200) return null;
-            var d = Json.Obj(t);
-            if (d == null || !d.ContainsKey("tunnels")) return null;
-            var arr = d["tunnels"] as System.Collections.IEnumerable;
-            if (arr == null) return null;
-            foreach (object o in arr) { string u = Json.Str(o as Dictionary<string, object>, "public_url"); if (u.StartsWith("https://")) return u; }
-            return null;
+            if (P != null && !P.HasExited) ConsoleCtrl.SendCtrlC(Pid);   // lets devtunnel close the tunnel cleanly; the base class kills it after 6 s if it ignores this
         }
 
         protected override void Evaluate()
         {
             if (pendingFatal != null) { string m = pendingFatal; pendingFatal = null; Fail(m); return; }
-            string url = QueryUrl();
-            if (url != null)
+            if (adoptedNoState) { adoptedNoState = false; ForceRestart("adopted tunnel process has no recorded URL"); return; }
+            if (!ready && Url.Length > 0 && (DateTime.UtcNow - urlSeenAt).TotalSeconds > 15) { ready = true; Log.Warn("Application", "devtunnel printed the URL but no 'Ready' line; treating the tunnel as connected."); }
+            if (ready && Url.Length > 0)
             {
-                if (url != Url) { Log.Info("Application", "Public tunnel URL " + (Url == "" ? "is" : "changed to") + ": " + url); Url = url; }
-                if (State != "Running") SetState("Running", "");
+                if (State != "Running") { SetState("Running", ""); AuthState = "ok"; SaveState(); Log.Info("Application", "Dev Tunnel connected: " + Url + " (tunnel " + TunnelId + ")"); }
+                return;
+            }
+            if (pendingAuth)
+            {
+                pendingAuth = false; AuthState = "required";
+                Fail("Dev Tunnels refused the sign-in (devtunnel said: " + lastErr + "). Open the Tunnel page and press Sign in.");
                 return;
             }
             bool net = NetworkInterface.GetIsNetworkAvailable();
-            if (State == "Starting")
+            if (State == "Starting" && (DateTime.UtcNow - startedAt).TotalSeconds > 45)
             {
-                if ((DateTime.UtcNow - startedAt).TotalSeconds > 30) { reconnectSince = DateTime.UtcNow; SetState("Reconnecting", net ? "Waiting for ngrok to connect..." : "No internet connection."); }
+                Fail(net ? "devtunnel did not report a ready tunnel within 45 seconds." + (lastErr.Length > 0 ? " Last message: " + lastErr : "") : "No internet connection.");
+                return;
             }
-            else if (State == "Running") { reconnectSince = DateTime.UtcNow; Url = ""; SetState("Reconnecting", net ? "Connection to ngrok lost; reconnecting..." : "No internet connection."); }
-            else if (State == "Reconnecting")
-            {
-                SetState("Reconnecting", net ? "Connection to ngrok lost; reconnecting..." : "No internet connection.");
-                if ((DateTime.UtcNow - reconnectSince).TotalSeconds > 90 && net) ForceRestart("tunnel did not recover within 90 seconds");
-            }
+            if (State == "Starting" && !net) SetState("Reconnecting", "No internet connection.");
+            else if (State == "Reconnecting" && net) { startedAt = DateTime.UtcNow; SetState("Starting", ""); }
         }
-        public void ClearUrl() { Url = ""; }
     }
 
     // ---- Supervisor loop ------------------------------------------------------
@@ -1047,6 +1234,7 @@ namespace PCWatch
             st["server_error"] = Server.Error;
             st["tunnel_state"] = Tunnel.State; st["tunnel_pid"] = Tunnel.Pid.ToString();
             st["tunnel_error"] = Tunnel.Error; st["tunnel_url"] = Tunnel.State == "Running" ? Tunnel.Url : "";
+            st["tunnel_auth"] = Tunnel.AuthState; st["tunnel_id"] = Tunnel.State == "Running" ? Tunnel.TunnelId : ""; st["tunnel_anonymous"] = Settings.GetBool("tunnel_anonymous") ? "1" : "0";
             try { Directory.CreateDirectory(Paths.RunDir); Ini.Write(StatusFile.FilePath, st); } catch { }
         }
         public void Shutdown()
@@ -1249,6 +1437,7 @@ namespace PCWatch
             if (!File.Exists(Paths.SettingsFile)) { MessageBox.Show("PC Watch is not configured. Run setup.exe first.", "PC Watch", MessageBoxButtons.OK, MessageBoxIcon.Warning); return 1; }
             Directory.CreateDirectory(Paths.RunDir);
             if (Array.IndexOf(args, "--startup") >= 0) Desired.ApplyStartupMode();
+            if (Settings.GetBool("tunnel_autostart")) Desired.Set("server", "1", "tunnel", "1");   // user-enabled: server + Dev Tunnel start with the background host
             Log.Info("Application", "Background host started (pid " + Process.GetCurrentProcess().Id + ")");
             Application.Run(new HostContext());
             return 0;
@@ -1292,6 +1481,7 @@ START = time.time()
 CFG_PATH = ''
 PORT = 8765
 HTTPD = None
+HTTPD6 = None
 LOCK = threading.RLock()
 CAMLOCK = threading.Lock()
 _cache = {'t': 0, 'd': {}}
@@ -1643,7 +1833,8 @@ def tunnel_status():
     d = read_ini(os.path.join(run_dir(), 'status.ini'))
     fresh = abs(time.time() - float(d.get('heartbeat_unix', '0') or 0)) < 30
     return {'host': fresh, 'tunnel': d.get('tunnel_state', 'Unknown') if fresh else 'Unknown',
-            'url': d.get('tunnel_url', '') if fresh else '', 'server': d.get('server_state', 'Unknown') if fresh else 'Unknown'}
+            'url': d.get('tunnel_url', '') if fresh else '', 'server': d.get('server_state', 'Unknown') if fresh else 'Unknown',
+            'auth': d.get('tunnel_auth', 'unknown') if fresh else 'unknown', 'anonymous': d.get('tunnel_anonymous', '0') == '1'}
 
 
 def request_host(name):
@@ -1661,7 +1852,7 @@ OPS = [{'name': 'pc_info', 'title': 'Retrieve PC information', 'sensitive': Fals
        {'name': 'check_network', 'title': 'Check network connectivity', 'sensitive': False},
        {'name': 'check_health', 'title': 'Check server health', 'sensitive': False},
        {'name': 'restart_server', 'title': 'Restart PC Watch server', 'sensitive': True},
-       {'name': 'restart_tunnel', 'title': 'Restart ngrok tunnel', 'sensitive': True},
+       {'name': 'restart_tunnel', 'title': 'Restart Dev Tunnel (the public URL will change)', 'sensitive': True},
        {'name': 'open_settings', 'title': 'Open a Windows settings page on the PC', 'sensitive': True},
        {'name': 'set_config', 'title': 'Change log level / log retention', 'sensitive': True}]
 
@@ -1678,7 +1869,7 @@ def run_op(name, body):
         except Exception as e:
             res['internet'] = 'unreachable: ' + str(e)
         try:
-            socket.gethostbyname('ngrok.com')
+            socket.gethostbyname('login.microsoftonline.com')
             res['dns'] = 'ok'
         except Exception as e:
             res['dns'] = 'failed: ' + str(e)
@@ -1694,7 +1885,7 @@ def run_op(name, body):
         return {'requested': True, 'note': 'The server will restart in a few seconds; reload this page afterwards.'}
     if name == 'restart_tunnel':
         request_host('restart_tunnel')
-        return {'requested': True, 'note': 'The tunnel will restart; the public URL may change on free ngrok plans.'}
+        return {'requested': True, 'note': 'The Dev Tunnel will restart and get a NEW public URL (it is a temporary tunnel). Ask the PC owner for the new link.'}
     if name == 'open_settings':
         uri = SETTINGS_PAGES.get(str(body.get('page', '')))
         if not uri:
@@ -1732,7 +1923,7 @@ def tail(path, n):
         return []
 
 
-LOGCATS = {'application': 'application.log', 'server': 'server.log', 'ngrok': 'ngrok.log',
+LOGCATS = {'application': 'application.log', 'server': 'server.log', 'tunnel': 'tunnel.log',
            'authentication': 'auth.log', 'connections': 'connections.log'}
 
 # ---------------------------------------------------------------- HTTP
@@ -1764,9 +1955,14 @@ class H(BaseHTTPRequestHandler):
     def peer_local(self):
         return self.client_address[0] in ('127.0.0.1', '::1')
 
+    def host_is_loopback(self):
+        h = (self.headers.get('Host') or '').lower()
+        return h.startswith('127.0.0.1') or h.startswith('localhost') or h.startswith('[::1]')
+
     def is_local(self):
-        # direct loopback call from PCWatch.exe: ngrok always adds X-Forwarded-For, so tunnel traffic never qualifies
-        if not self.peer_local():
+        # direct loopback call from PCWatch.exe. Dev Tunnel traffic also reaches us from 127.0.0.1, so it is told apart by the
+        # Host header (PCWatch.exe always uses 127.0.0.1), by forwarding headers and, finally, by the secret local key.
+        if not self.peer_local() or not self.host_is_loopback():
             return False
         for h in ('X-Forwarded-For', 'X-Forwarded-Host', 'Forwarded', 'X-Real-Ip'):
             if self.headers.get(h):
@@ -1895,8 +2091,8 @@ class H(BaseHTTPRequestHandler):
         log('Connections', 'INFO', 'Remote session opened by %s from %s' % (a['user'], ip))
         write_last(ip, a['user'])
         ck = 'pcw_sid=%s; Path=/; HttpOnly; SameSite=Strict; Max-Age=%d' % (sid, MAXAGE)
-        if self.headers.get('X-Forwarded-Proto', '') == 'https':
-            ck += '; Secure'
+        if self.headers.get('X-Forwarded-Proto', '') == 'https' or not self.host_is_loopback():
+            ck += '; Secure'      # anything that did not come straight from loopback came through the HTTPS tunnel
         s = SESSIONS[sid]
         self.send_json(200, {'user': a['user'], 'csrf': s['csrf']}, [('Set-Cookie', ck)])
 
@@ -1996,16 +2192,22 @@ class H(BaseHTTPRequestHandler):
         return self.send_json(404, {'error': 'Not found'})
 
 
+class H6(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
 def shutdown():
     time.sleep(0.2)
     for k in ('screen', 'camera'):
         media_stop(k, 'server shutting down')
+    if HTTPD6 is not None:
+        HTTPD6.shutdown()
     if HTTPD is not None:
         HTTPD.shutdown()
 
 
 def main():
-    global CFG_PATH, PORT, HTTPD
+    global CFG_PATH, PORT, HTTPD, HTTPD6
     CFG_PATH = arg('--config') or ''
     if not CFG_PATH:
         print('ERROR: --config is required')
@@ -2026,6 +2228,11 @@ def main():
         log('Server', 'ERROR', 'Cannot listen on port %d: %s' % (PORT, e))
         print('ERROR: port %d unavailable' % PORT)
         return 10
+    try:
+        HTTPD6 = H6(('::1', PORT), H)      # loopback only: the tunnel client may resolve localhost to ::1
+        threading.Thread(target=HTTPD6.serve_forever, daemon=True).start()
+    except Exception:
+        HTTPD6 = None
     try:
         import psutil
         psutil.cpu_percent(interval=None)
@@ -2109,9 +2316,10 @@ function showApp(){ $('login').hidden = true; $('app').hidden = false; buildTabs
 function stopAll(){ if (poll) clearInterval(poll); poll = null; if (frameT) clearTimeout(frameT); frameT = null; }
 function fmtB(n){ return (n / 1073741824).toFixed(1) + ' GB'; }
 function fmtT(s){ var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); return (d ? d + 'd ' : '') + h + 'h ' + m + 'm'; }
-function badge(txt){
-  var c = {Running:'ok', Starting:'wn', Reconnecting:'wn', Restarting:'wn', Stopped:'bad2', Error:'bad2'}[txt] || 'gr';
-  return el('span', 'badge ' + c, txt);
+function badge(txt, tun){
+  var c = {Running:'ok', Starting:'wn', Preparing:'wn', Reconnecting:'wn', Restarting:'wn', Stopped:'bad2', Error:'bad2'}[txt] || 'gr';
+  var L = {Running:'Connected', Starting:'Connecting', Preparing:'Connecting', Reconnecting:'Connecting', Restarting:'Connecting', Stopped:'Disconnected', Error:'Error'};
+  return el('span', 'badge ' + c, tun ? (L[txt] || txt) : txt);
 }
 function kv(card, k, v){ var r = el('div', 'kv'); r.appendChild(el('span', '', k)); var s = el('span'); if (v instanceof Node) s.appendChild(v); else s.textContent = v; r.appendChild(s); card.appendChild(r); }
 function card(title){ var c = el('div', 'card'); c.appendChild(el('h2', '', title)); return c; }
@@ -2138,8 +2346,9 @@ function drawStatus(v, d){
   var f = document.createDocumentFragment();
   var c = card('Services');
   kv(c, 'PC Watch server', badge('Running'));
-  kv(c, 'Tunnel', badge(d.tunnel.tunnel));
+  kv(c, 'Dev Tunnel', badge(d.tunnel.tunnel, true));
   kv(c, 'Public URL', d.tunnel.url || '-');
+  kv(c, 'Tunnel access', d.tunnel.anonymous ? 'ANONYMOUS (anyone with the link)' : 'Private (signed-in owner only)');
   f.appendChild(c);
   c = card('Resources');
   kv(c, 'CPU ' + Math.round(d.cpu) + '%', bar(d.cpu));
@@ -2164,7 +2373,7 @@ function drawSystem(v, d){
 function drawLogs(v){
   v.textContent = '';
   var c = card('Logs'), s = el('select'), pre = el('pre');
-  ['server','application','ngrok','authentication','connections'].forEach(function(x){ var o = el('option', '', x); o.value = x; s.appendChild(o); });
+  ['server','application','tunnel','authentication','connections'].forEach(function(x){ var o = el('option', '', x); o.value = x; s.appendChild(o); });
   function load(){ api('/api/logs?cat=' + s.value).then(function(d){ pre.textContent = d.lines.join('\n') || '(empty)'; pre.scrollTop = pre.scrollHeight; }).catch(function(e){ pre.textContent = e.message; }); }
   s.onchange = load; var b = el('button', '', 'Refresh'); b.onclick = load;
   var r = el('div', 'row'); r.appendChild(s); r.appendChild(b); c.appendChild(r); c.appendChild(pre); v.appendChild(c); load();
@@ -2247,7 +2456,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             {
                 case "Running": return Good;
                 case "Stopped": case "Error": return Bad;
-                case "Starting": case "Restarting": case "Reconnecting": case "Stopping": return Warn;
+                case "Starting": case "Preparing": case "Restarting": case "Reconnecting": case "Stopping": return Warn;
                 default: return Gray;
             }
         }
@@ -2496,7 +2705,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             {
                 case "Application": return new[] { "application.log" };
                 case "Server": return new[] { "server.log", "server-process.log" };
-                case "ngrok": return new[] { "ngrok.log" };
+                case "Tunnel": return new[] { "tunnel.log" };
                 case "Installation": return new[] { "install.log" };
                 case "Authentication": return new[] { "auth.log" };
                 case "Connections": return new[] { "connections.log" };
@@ -2574,7 +2783,8 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
     internal sealed class Snapshot
     {
         public bool HostAlive;
-        public string ServerState = "Unknown", TunnelState = "Unknown", ServerError = "", TunnelError = "", TunnelUrl = "";
+        public string ServerState = "Unknown", TunnelState = "Unknown", ServerError = "", TunnelError = "", TunnelUrl = "", TunnelAuth = "unknown", TunnelId = "";
+        public bool TunnelAnon;
         public int ServerPid, TunnelPid, Logins;
         public long ServerStartedUnix;
         public double Cpu; public ulong RamTotal, RamAvail; public TimeSpan SysUptime;
@@ -2615,8 +2825,8 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         Label title; int cur = -1; Snapshot snap = new Snapshot(); volatile bool closing; bool stopAllOnExit;
         RichTextBox rtRecent, rtLogs; TextBox tbStatusOut, tbUrl, tbSearch; ComboBox cbCat; Label lblTest;
         DateTime clearedAt = DateTime.MinValue; List<LogEntry> shown = new List<LogEntry>();
-        NumericUpDown nPort, nRet, nTunPort, nSess; ComboBox cStartup, cLevel, cTheme; CheckBox kStop, kScreen, kCam;
-        TextBox tPy, tNg, tDom, tToken, tLogDir, tUser, tPw1, tPw2; Label tokenState;
+        NumericUpDown nPort, nRet, nRetry, nSess; ComboBox cStartup, cLevel, cTheme; CheckBox kStop, kScreen, kCam, kTunAuto, kTunStop, kAnon, cDevice;
+        TextBox tPy, tDt, tLogDir, tUser, tPw1, tPw2; Label anonBanner;
 
         public DashboardForm(EventWaitHandle ev)
         {
@@ -2664,10 +2874,10 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             if (string.IsNullOrEmpty(e)) return "";
             string l = e.ToLowerInvariant(), tip = "";
             if (l.Contains("port")) tip = "Fix: open Settings, choose a free server port (for example 8766), then start again.";
-            else if (l.Contains("authtoken")) tip = "Fix: Tunnel page > Set authtoken (token from dashboard.ngrok.com > Your Authtoken).";
+            else if (l.Contains("sign-in") || l.Contains("sign in") || l.Contains("signed in")) tip = "Fix: Tunnel page > Sign in with Microsoft or GitHub, then Start Tunnel.";
             else if (l.Contains("python")) tip = "Fix: About > Repair reinstalls Python and the server files.";
             else if (l.Contains("internet")) tip = "Fix: check the PC's internet connection. The tunnel reconnects by itself.";
-            else if (l.Contains("ngrok")) tip = "Fix: see Activity Logs > ngrok, or run About > Repair.";
+            else if (l.Contains("devtunnel") || l.Contains("dev tunnel")) tip = "Fix: see Activity Logs > Tunnel, or run About > Repair.";
             return e + (tip.Length > 0 ? "\r\n" + tip : "");
         }
 
@@ -2740,6 +2950,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         {
             if (stopAllOnExit) { try { var ev = EventWaitHandle.OpenExisting("Local\\PCWatch.Host.Exit"); ev.Set(); ev.Dispose(); } catch { } }
             else if (Settings.GetBool("stop_on_exit")) Desired.StopBoth();
+            else if (Settings.GetBool("tunnel_stop_on_exit")) Desired.StopTunnel();
             closing = true;
             base.OnFormClosing(e);
         }
@@ -2751,7 +2962,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             var strip = new TableLayoutPanel { ColumnCount = 4, RowCount = 2, BackColor = Color.Transparent };
             for (int i = 0; i < 4; i++) strip.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25));
             strip.RowStyles.Add(new RowStyle(SizeType.Absolute, 22)); strip.RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
-            string[] caps = { "SERVER", "TUNNEL", "REMOTE ENDPOINT", "BACKGROUND" }, ids = { "server", "tunnel", "endpoint", "host2" };
+            string[] caps = { "SERVER", "DEV TUNNEL", "REMOTE ENDPOINT", "BACKGROUND" }, ids = { "server", "tunnel", "endpoint", "host2" };
             for (int i = 0; i < 4; i++) { strip.Controls.Add(UI.Lbl(caps[i], 8f, true, Theme.Muted), i, 0); strip.Controls.Add(Bdg(ids[i]), i, 1); }
             c1.AddWide(strip, 62);
 
@@ -2837,60 +3048,128 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             Log.Info("Application", "Server port changed from " + old + " to " + p);
         }
 
-        // ---- Tunnel ----------------------------------------------------------------
+        // ---- Tunnel (Microsoft Dev Tunnels) ------------------------------------------
         void BuildTunnel()
         {
-            var c1 = new Card("Tunnel status");
+            anonBanner = new Label { Text = "SECURITY WARNING: this Dev Tunnel allows ANONYMOUS access. Anyone who has the link can reach the PC Watch login page. Turn it off in Settings > Dev Tunnel.",
+                ForeColor = Color.White, BackColor = Theme.Bad, Font = UI.F(10f, true), Height = 56, Padding = new Padding(12, 6, 12, 6), Margin = new Padding(0, 0, 0, 14), Visible = false, TextAlign = ContentAlignment.MiddleLeft };
+
+            var c1 = new Card("Dev Tunnel status");
             c1.AddRow("Status", Bdg("tunnel_b"), 36);
+            c1.AddRow("Authentication", Val("tauth"), 30);
+            c1.AddRow("Local forwarded port", Val("tfwd"), 30);
             var up = new Panel { BackColor = Color.Transparent };
             tbUrl = new TextBox { ReadOnly = true, Dock = DockStyle.Fill, BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle };
-            var cp = new Btn("Copy", 0) { Dock = DockStyle.Right, AutoSize = false, Width = 74 }; cp.Click += delegate { CopyUrl(); };
+            var cp = new Btn("Copy URL", 0) { Dock = DockStyle.Right, AutoSize = false, Width = 90 }; cp.Click += delegate { CopyUrl(); };
             up.Controls.Add(tbUrl); up.Controls.Add(cp);
-            c1.AddRow("Public HTTPS URL", up, 38);
-            c1.AddRow("Process ID", Val("tpid"), 30); c1.AddRow("Forwarding to", Val("tfwd"), 30); c1.AddRow("Authtoken", Val("ttok"), 30);
-            var er = Val("terr"); er.ForeColor = Theme.Warn; er.AutoEllipsis = false; c1.AddRow("Details", er, 64);
+            c1.AddRow("Public URL (from devtunnel)", up, 38);
+            c1.AddRow("Tunnel ID", Val("tid"), 30); c1.AddRow("Access", Val("tacc"), 30); c1.AddRow("Process ID", Val("tpid"), 30);
+            var er = Val("terr"); er.ForeColor = Theme.Warn; er.AutoEllipsis = false; c1.AddRow("Connection message", er, 70);
 
-            var c2 = new Card("Controls");
-            var start = Mk("Start Tunnel", 1, delegate { Do(Desired.StartTunnel); }); var stop = Mk("Stop Tunnel", 2, delegate { Do(Desired.StopTunnel); });
-            var rest = Mk("Restart Tunnel", 0, delegate { Do(Desired.StartTunnel); });
+            var c2 = new Card("Tunnel controls");
+            var start = Mk("Start Tunnel", 1, delegate { StartTunnelGuided(); }); var stop = Mk("Stop Tunnel", 2, delegate { Do(Desired.StopTunnel); });
+            var rest = Mk("Restart Tunnel", 0, delegate { StartTunnelGuided(); });
             Bt["tunStart"] = start; Bt["tunStop"] = stop; Bt["tunRestart"] = rest;
-            c2.AddWide(Flow(start, stop, rest, Mk("Test Connectivity", 0, TestTunnel), Mk("Set authtoken", 0, SetToken), Mk("View ngrok Logs", 0, delegate { GoLogs("ngrok"); })), 92);
+            c2.AddWide(Flow(start, stop, rest, Mk("Copy URL", 0, CopyUrl), Mk("Verify connectivity", 0, TestTunnel), Mk("View tunnel logs", 0, delegate { GoLogs("Tunnel"); })), 92);
 
-            var c3 = new Card("Tunnel configuration");
-            nTunPort = new NumericUpDown { Minimum = 0, Maximum = 65535, Value = 0 }; UI.Style(nTunPort);
-            c3.AddRow("Forward to local port (0 = server port)", nTunPort, 36);
-            c3.AddWide(Flow(Mk("Apply tunnel port", 0, delegate
-            {
-                Settings.Set("tunnel_port", ((int)nTunPort.Value).ToString()); if (Desired.Flag(Desired.Load(), "tunnel")) Do(Desired.StartTunnel);
-            })), 46);
-            lblTest = Val("ttest"); lblTest.AutoEllipsis = false; c3.AddRow("Connectivity test", lblTest, 44);
-            pages[2].Add(c1, c2, c3);
+            var c3 = new Card("Sign in (Microsoft Dev Tunnels)");
+            var note = UI.Lbl("Dev Tunnels needs a Microsoft or GitHub sign-in. PC Watch runs 'devtunnel user login' for you and only says 'Signed in' after the CLI confirms it. devtunnel keeps the sign-in in the Windows credential store; PC Watch never sees or stores your password or token.", 9f, false, Theme.Muted);
+            note.AutoEllipsis = false; c3.AddWide(note, 66);
+            cDevice = UI.Chk("Use device code (if no browser opens on this PC)"); c3.AddWide(cDevice, 30);
+            var chk = Val("tchk"); chk.AutoEllipsis = false; c3.AddRow("Last check", chk, 48);
+            c3.AddWide(Flow(Mk("Sign in with Microsoft", 1, delegate { StartLogin(false); }), Mk("Sign in with GitHub", 0, delegate { StartLogin(true); }),
+                Mk("Check sign-in", 0, CheckSignIn), Mk("Sign out", 2, SignOut)), 92);
+
+            var c4 = new Card("Connectivity test");
+            lblTest = Val("ttest"); lblTest.AutoEllipsis = false; c4.AddRow("Result", lblTest, 60);
+            var n2 = UI.Lbl("A private tunnel shows a Microsoft/GitHub sign-in page to anyone who is not signed in; that counts as reachable. The public URL changes every time the tunnel starts (temporary dev tunnel).", 9f, false, Theme.Muted);
+            n2.AutoEllipsis = false; c4.AddWide(n2, 48);
+            pages[2].Add(anonBanner, c1, c2, c3, c4);
         }
 
-        void SetToken()
+        // Start Tunnel: if devtunnel is installed and clearly NOT signed in, guide the user through the sign-in first
+        // (a browser opens only then). If the CLI is not installed yet, the background host downloads and verifies it itself.
+        void StartTunnelGuided()
         {
-            string t = Prompt.Ask(this, "ngrok authtoken", "Paste your ngrok authtoken (stored encrypted for this Windows user, never shown or logged):", "", true);
-            if (t == null) return;
-            t = t.Trim();
-            if (t.Length < 20 || !Regex.IsMatch(t, @"^[A-Za-z0-9_]+$")) { MessageBox.Show(this, "That does not look like an ngrok authtoken.", "PC Watch", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-            Secrets.Save(Paths.TokenFile, t); Log.AddSecret(t);
-            Log.Info("Application", "ngrok authtoken updated");
-            if (Desired.Flag(Desired.Load(), "tunnel")) Do(Desired.StartTunnel);
+            if (string.IsNullOrEmpty(DevTunnelCli.Exe) || !File.Exists(DevTunnelCli.Exe)) { Do(Desired.StartTunnel); return; }
+            V["tchk"].Text = "Checking the Dev Tunnels sign-in..."; V["tchk"].ForeColor = Theme.Text;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string line; DtAuth a = DevTunnelCli.UserShow(out line);
+                try
+                {
+                    BeginInvoke(new Action(delegate
+                    {
+                        if (a == DtAuth.SignedOut)
+                        {
+                            ShowCheck("NOT signed in. devtunnel says: " + line, Theme.Bad);
+                            if (MessageBox.Show(this, "Dev Tunnels is not signed in (devtunnel says: " + line + ").\r\n\r\nSign in now with a Microsoft account? A browser window will open. (For GitHub, cancel and use 'Sign in with GitHub'.)",
+                                "Dev Tunnels sign-in", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes) StartLogin(false, true);
+                            return;
+                        }
+                        V["tchk"].Text = a == DtAuth.SignedIn ? "Signed in. devtunnel says: " + line : "Could not confirm the sign-in (devtunnel says: " + line + "). Starting anyway; the tunnel reports any sign-in problem.";
+                        V["tchk"].ForeColor = a == DtAuth.SignedIn ? Theme.Good : Theme.Warn;
+                        Do(Desired.StartTunnel);
+                    }));
+                }
+                catch { }
+            });
+        }
+
+        void StartLogin(bool github) { StartLogin(github, false); }
+        void StartLogin(bool github, bool thenStart)
+        {
+            if (string.IsNullOrEmpty(DevTunnelCli.Exe) || !File.Exists(DevTunnelCli.Exe))
+            {
+                MessageBox.Show(this, "The Dev Tunnels CLI has not been downloaded yet. Press 'Start Tunnel': PC Watch downloads and verifies it automatically, then you can sign in.", "PC Watch", MessageBoxButtons.OK, MessageBoxIcon.Information); return;
+            }
+            bool ok;
+            using (var f = new LoginForm(github, cDevice.Checked)) { f.ShowDialog(this); ok = f.Confirmed; }
+            CheckSignIn();
+            if (ok && (thenStart || Desired.Flag(Desired.Load(), "tunnel"))) Do(Desired.StartTunnel);   // (re)start a tunnel that was waiting for the sign-in
+        }
+
+        void ShowCheck(string text, Color c) { try { BeginInvoke(new Action(delegate { V["tchk"].Text = text; V["tchk"].ForeColor = c; })); } catch { } }
+
+        void CheckSignIn()
+        {
+            V["tchk"].Text = "Checking..."; V["tchk"].ForeColor = Theme.Text;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string line; DtAuth a = DevTunnelCli.UserShow(out line);
+                if (a == DtAuth.SignedIn) ShowCheck("Signed in. devtunnel says: " + line, Theme.Good);
+                else if (a == DtAuth.SignedOut) ShowCheck("NOT signed in. devtunnel says: " + line, Theme.Bad);
+                else ShowCheck("Could not tell (devtunnel says: " + line + "). Starting the tunnel will show whether the sign-in works.", Theme.Warn);
+            });
+        }
+
+        void SignOut()
+        {
+            if (MessageBox.Show(this, "Sign out of Dev Tunnels?\r\n\r\nThe tunnel is stopped first and cannot start again until you sign in.", "Dev Tunnels", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            Do(Desired.StopTunnel); V["tchk"].Text = "Signing out..."; V["tchk"].ForeColor = Theme.Text;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                for (int i = 0; i < 40 && snap.HostAlive && snap.TunnelState != "Stopped"; i++) Thread.Sleep(250);
+                string o; int c = ProcTools.Run(DevTunnelCli.Exe, "user logout", 30000, out o);
+                string line; DtAuth a = DevTunnelCli.UserShow(out line);
+                Log.Info("Application", "Dev Tunnels sign-out finished (exit code " + c + ")");
+                ShowCheck((c == 0 ? "Signed out. " : "devtunnel exited with code " + c + ". ") + "devtunnel says: " + line, a == DtAuth.SignedIn ? Theme.Bad : Theme.Text);
+            });
         }
 
         void TestTunnel()
         {
             string url = snap.TunnelUrl;
-            if (string.IsNullOrEmpty(url)) { lblTest.Text = "No public URL: the tunnel is not running."; return; }
+            if (string.IsNullOrEmpty(url)) { lblTest.Text = "No public URL: the tunnel is not connected."; return; }
             lblTest.Text = "Testing...";
             ThreadPool.QueueUserWorkItem(delegate
             {
                 var sw = Stopwatch.StartNew(); string t;
-                var h = new Dictionary<string, string>(); h["ngrok-skip-browser-warning"] = "1";
-                int c = Http.Send("GET", url + "/api/health", null, h, 12000, false, out t);
+                int c = Http.Send("GET", url + "api/health", null, null, 15000, false, out t);
                 string r = c == 200 && t.Contains("pc-watch") ? "OK: the public URL reaches the PC Watch server (" + sw.ElapsedMilliseconds + " ms)."
-                    : c == 502 || c == 503 || c == 404 ? "Tunnel is up but the server did not answer (HTTP " + c + "). Is the server running on the forwarded port?"
-                    : c == 0 ? "Not reachable: " + t : "Unexpected answer: HTTP " + c;
+                    : c == 200 ? "The public URL is reachable and answered with a page that is not PC Watch's (for a private tunnel this is the Microsoft/GitHub sign-in page). Open the URL in a browser signed in to the same account."
+                    : c == 502 || c == 503 || c == 504 ? "The tunnel is up but the PC Watch server did not answer (HTTP " + c + "). Is the server running?"
+                    : c == 0 ? "Not reachable: " + t : "The tunnel answered with HTTP " + c + " (a private tunnel normally asks for a sign-in).";
                 try { BeginInvoke(new Action(delegate { lblTest.Text = r; })); } catch { }
             });
         }
@@ -2945,7 +3224,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         {
             var c1 = new Card("Filter");
             cbCat = new ComboBox { Width = 160, Margin = new Padding(0, 3, 10, 0) }; UI.Style(cbCat); cbCat.Anchor = AnchorStyles.Left;
-            cbCat.Items.AddRange(new object[] { "All", "Application", "Server", "ngrok", "Installation", "Authentication", "Connections", "Errors" }); cbCat.SelectedIndex = 0;
+            cbCat.Items.AddRange(new object[] { "All", "Application", "Server", "Tunnel", "Installation", "Authentication", "Connections", "Errors" }); cbCat.SelectedIndex = 0;
             cbCat.SelectedIndexChanged += delegate { RefreshLogs(); };
             tbSearch = new TextBox { Width = 220, Margin = new Padding(0, 4, 10, 0), BackColor = Theme.Input, ForeColor = Theme.Text, BorderStyle = BorderStyle.FixedSingle };
             tbSearch.TextChanged += delegate { RefreshLogs(); };
@@ -3005,13 +3284,18 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             var note = UI.Lbl("Windows startup only starts the hidden background component (HKCU Run entry, visible in Task Manager > Startup). The dashboard window never opens by itself.", 9f, false, Theme.Muted);
             note.AutoEllipsis = false; c1.AddWide(note, 44);
 
-            var c2 = new Card("Tunnel");
-            tDom = Tb(false); tToken = Tb(true); tokenState = Val("tokstate");
-            c2.AddRow("Reserved ngrok domain (optional)", tDom, 36); c2.AddRow("New authtoken (blank = keep)", tToken, 36); c2.AddRow("Current authtoken", tokenState, 30);
+            var c2 = new Card("Dev Tunnel (Microsoft)");
+            kTunAuto = UI.Chk("Start the tunnel automatically when PC Watch's background component starts");
+            kTunStop = UI.Chk("Stop the tunnel when the dashboard is closed");
+            nRetry = new NumericUpDown { Minimum = 0, Maximum = 20, Value = 5 }; UI.Style(nRetry);
+            kAnon = UI.Chk("Allow ANONYMOUS access (anyone with the link) - NOT recommended"); kAnon.ForeColor = Theme.Bad;
+            c2.AddWide(kTunAuto, 32); c2.AddWide(kTunStop, 32); c2.AddRow("Automatic restarts after a crash (0 = never)", nRetry, 36); c2.AddWide(kAnon, 32);
+            var aw = UI.Lbl("By default the tunnel is PRIVATE: only the Microsoft or GitHub account that signed in to Dev Tunnels can open the link. Anonymous access exposes the PC Watch login page to the whole internet. Changes apply the next time the tunnel starts.", 9f, false, Theme.Muted);
+            aw.AutoEllipsis = false; c2.AddWide(aw, 56);
 
             var c3 = new Card("Paths");
-            TextBox t1, t2; Panel p1 = PathBox(out t1), p2 = PathBox(out t2); tPy = t1; tNg = t2; tLogDir = Tb(false);
-            c3.AddRow("Installation path", Val("s_inst"), 30); c3.AddRow("Python path", p1, 38); c3.AddRow("ngrok path", p2, 38); c3.AddRow("Log folder (blank = default)", tLogDir, 36);
+            TextBox t1, t2; Panel p1 = PathBox(out t1), p2 = PathBox(out t2); tPy = t1; tDt = t2; tLogDir = Tb(false);
+            c3.AddRow("Installation path", Val("s_inst"), 30); c3.AddRow("Python path", p1, 38); c3.AddRow("Dev Tunnels CLI path", p2, 38); c3.AddRow("Log folder (blank = default)", tLogDir, 36);
 
             var c4 = new Card("Logging");
             cLevel = new ComboBox(); UI.Style(cLevel); cLevel.Items.AddRange(new object[] { "DEBUG", "INFO", "WARNING", "ERROR" });
@@ -3039,14 +3323,13 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             nPort.Value = Math.Max(nPort.Minimum, Math.Min(nPort.Maximum, Settings.GetInt("server_port", 8765)));
             cStartup.SelectedIndex = Math.Max(0, Math.Min(2, Settings.GetInt("startup_mode", 0)));
             kStop.Checked = Settings.GetBool("stop_on_exit");
-            tDom.Text = Settings.Get("ngrok_domain"); tToken.Text = "";
-            V["tokstate"].Text = File.Exists(Paths.TokenFile) ? "Configured (hidden)" : "Not set";
-            V["s_inst"].Text = Paths.InstallDir; tPy.Text = Settings.Get("python_path"); tNg.Text = Settings.Get("ngrok_path"); tLogDir.Text = Settings.Get("log_dir");
+            kTunAuto.Checked = Settings.GetBool("tunnel_autostart"); kTunStop.Checked = Settings.GetBool("tunnel_stop_on_exit"); kAnon.Checked = Settings.GetBool("tunnel_anonymous");
+            nRetry.Value = Math.Max(nRetry.Minimum, Math.Min(nRetry.Maximum, Settings.GetInt("tunnel_retry_limit", 5)));
+            V["s_inst"].Text = Paths.InstallDir; tPy.Text = Settings.Get("python_path"); tDt.Text = Settings.Get("devtunnel_path"); tLogDir.Text = Settings.Get("log_dir");
             cLevel.SelectedItem = Settings.Get("log_level").ToUpperInvariant(); if (cLevel.SelectedIndex < 0) cLevel.SelectedIndex = 1;
             nRet.Value = Math.Max(nRet.Minimum, Math.Min(nRet.Maximum, Settings.GetInt("log_retention_days", 14)));
             tUser.Text = Settings.Get("remote_user"); tPw1.Text = ""; tPw2.Text = "";
             cTheme.SelectedItem = Settings.Get("theme"); if (cTheme.SelectedIndex < 0) cTheme.SelectedIndex = 0;
-            nTunPort.Value = Math.Max(0, Math.Min(65535, Settings.GetInt("tunnel_port", 0)));
             kScreen.Checked = Settings.GetBool("allow_screen"); kCam.Checked = Settings.GetBool("allow_camera");
             nSess.Value = Math.Max(nSess.Minimum, Math.Min(nSess.Maximum, Settings.GetInt("session_minutes", 30)));
         }
@@ -3058,17 +3341,16 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             int port = (int)nPort.Value, oldPort = Settings.GetInt("server_port", 8765);
             if (port != oldPort && PortTools.InUse(port)) { Warn("Port " + port + " is already in use by another program."); return; }
             if (!File.Exists(tPy.Text.Trim())) { Warn("The Python path does not exist."); return; }
-            if (!File.Exists(tNg.Text.Trim())) { Warn("The ngrok path does not exist."); return; }
-            string dom = tDom.Text.Trim();
-            if (dom.Length > 0 && !Regex.IsMatch(dom, @"^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$")) { Warn("The reserved domain must look like name.ngrok-free.app."); return; }
+            if (!File.Exists(tDt.Text.Trim())) { Warn("The Dev Tunnels CLI path does not exist."); return; }
+            if (kAnon.Checked && !Settings.GetBool("tunnel_anonymous") &&
+                MessageBox.Show(this, "SECURITY WARNING\r\n\r\nAnonymous access means ANYONE on the internet who has the tunnel link can reach the PC Watch login page (Microsoft/GitHub sign-in will no longer protect it). Only PC Watch's own password remains.\r\n\r\nAllow anonymous access?",
+                    "Allow anonymous tunnel access?", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
             string logDir = tLogDir.Text.Trim();
             if (logDir.Length > 0)
             {
                 try { Directory.CreateDirectory(logDir); string probe = Path.Combine(logDir, ".write-test"); File.WriteAllText(probe, "x"); File.Delete(probe); }
                 catch (Exception ex) { Warn("The log folder is not writable: " + ex.Message); return; }
             }
-            string tok = tToken.Text.Trim();
-            if (tok.Length > 0 && (tok.Length < 20 || !Regex.IsMatch(tok, @"^[A-Za-z0-9_]+$"))) { Warn("That does not look like an ngrok authtoken."); return; }
             string user = tUser.Text.Trim(), pw = tPw1.Text;
             if (pw.Length > 0 || user != Settings.Get("remote_user"))
             {
@@ -3079,12 +3361,12 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                 if (pe != null) { Warn(pe); return; }
             }
             if (pw.Length > 0) { string ae = AuthTool.Set(user, pw); if (ae != null) { Warn(ae); return; } }
-            if (tok.Length > 0) { Secrets.Save(Paths.TokenFile, tok); Log.AddSecret(tok); }
             var d = new Dictionary<string, string>();
             d["server_port"] = port.ToString(); d["startup_mode"] = cStartup.SelectedIndex.ToString(); d["stop_on_exit"] = kStop.Checked ? "1" : "0";
-            d["ngrok_domain"] = dom; d["python_path"] = tPy.Text.Trim(); d["ngrok_path"] = tNg.Text.Trim(); d["log_dir"] = logDir;
+            d["python_path"] = tPy.Text.Trim(); d["devtunnel_path"] = tDt.Text.Trim(); d["log_dir"] = logDir;
+            d["tunnel_autostart"] = kTunAuto.Checked ? "1" : "0"; d["tunnel_stop_on_exit"] = kTunStop.Checked ? "1" : "0"; d["tunnel_anonymous"] = kAnon.Checked ? "1" : "0"; d["tunnel_retry_limit"] = ((int)nRetry.Value).ToString();
             d["log_level"] = (string)cLevel.SelectedItem; d["log_retention_days"] = ((int)nRet.Value).ToString(); d["theme"] = (string)cTheme.SelectedItem;
-            bool tunnelChanged = dom != Settings.Get("ngrok_domain") || tok.Length > 0;
+            bool tunnelChanged = kAnon.Checked != Settings.GetBool("tunnel_anonymous") || tDt.Text.Trim() != Settings.Get("devtunnel_path");
             Settings.Save(d);
             StartupReg.Apply(cStartup.SelectedIndex);
             var des = Desired.Load();
@@ -3097,9 +3379,9 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
 
         void ResetSettings()
         {
-            if (MessageBox.Show(this, "Reset port, startup, logging, tunnel and permission settings to their defaults?\r\n(Paths, credentials and the authtoken are kept.)", "Reset to defaults", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+            if (MessageBox.Show(this, "Reset port, startup, logging, tunnel and permission settings to their defaults?\r\n(Paths and credentials are kept. The Dev Tunnels sign-in is not touched.)", "Reset to defaults", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
             var d = Settings.Defaults();
-            foreach (string k in new[] { "python_path", "ngrok_path", "local_key_sha256", "remote_user", "log_dir" }) d.Remove(k);
+            foreach (string k in new[] { "python_path", "devtunnel_path", "local_key_sha256", "remote_user", "log_dir" }) d.Remove(k);
             int old = Settings.GetInt("server_port", 8765);
             Settings.Save(d); StartupReg.Apply(0);
             if (old != 8765) { var des = Desired.Load(); if (Desired.Flag(des, "server")) Do(Desired.StartServer); if (Desired.Flag(des, "tunnel")) Do(Desired.StartTunnel); }
@@ -3110,7 +3392,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         void BuildAbout()
         {
             var c1 = new Card("PC Watch");
-            c1.AddRow("Version", Val("a_ver"), 30); c1.AddRow("Installed in", Val("a_dir"), 30); c1.AddRow("Python", Val("a_py"), 30); c1.AddRow("ngrok", Val("a_ng"), 30);
+            c1.AddRow("Version", Val("a_ver"), 30); c1.AddRow("Installed in", Val("a_dir"), 30); c1.AddRow("Python", Val("a_py"), 30); c1.AddRow("Dev Tunnels CLI", Val("a_ng"), 30);
             c1.AddRow("Logs", Val("a_logs"), 30); c1.AddRow("Built by", Val("a_by"), 30);
             V["a_ver"].Text = Program.Version; V["a_dir"].Text = Paths.InstallDir; V["a_logs"].Text = Log.Dir; V["a_by"].Text = "Designed by MD";
             V["a_py"].Text = "checking..."; V["a_ng"].Text = "checking...";
@@ -3118,7 +3400,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             {
                 string o1, o2;
                 try { ProcTools.Run(Settings.Get("python_path"), "--version", 8000, out o1); } catch { o1 = "not found"; }
-                try { ProcTools.Run(Settings.Get("ngrok_path"), "version", 8000, out o2); } catch { o2 = "not found"; }
+                try { ProcTools.Run(Settings.Get("devtunnel_path"), "--version", 15000, out o2); } catch { o2 = "not found"; }
                 try { BeginInvoke(new Action(delegate { V["a_py"].Text = o1.Trim() + "  (" + Settings.Get("python_path") + ")"; V["a_ng"].Text = o2.Trim(); })); } catch { }
             });
             var c2 = new Card("Maintenance");
@@ -3127,7 +3409,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                 Mk("Repair", 0, delegate { Maint.Launch("--repair", this); }),
                 Mk("Uninstall", 2, delegate { Maint.Launch("--uninstall", this); })), 92);
             var c3 = new Card("How it works");
-            var t = UI.Lbl("PCWatch.exe is only the control panel. A hidden background component (tray icon) runs the Python server and the ngrok tunnel, so they keep working when this window is closed or hidden. The remote dashboard is served at your ngrok HTTPS URL behind a login.", 9.5f, false, Theme.Muted);
+            var t = UI.Lbl("PCWatch.exe is only the control panel. A hidden background component (tray icon) runs the Python server and the Microsoft Dev Tunnel, so they keep working when this window is closed or hidden. The remote dashboard is served at your Dev Tunnels HTTPS URL; by default the tunnel is private to your signed-in Microsoft/GitHub account, and PC Watch adds its own login.", 9.5f, false, Theme.Muted);
             t.AutoEllipsis = false; c3.AddWide(t, 80);
             pages[7].Add(c1, c2, c3);
         }
@@ -3156,6 +3438,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             {
                 s.ServerState = G(st, "server_state"); s.TunnelState = G(st, "tunnel_state");
                 s.ServerError = G(st, "server_error"); s.TunnelError = G(st, "tunnel_error"); s.TunnelUrl = G(st, "tunnel_url");
+                s.TunnelAuth = G(st, "tunnel_auth"); s.TunnelId = G(st, "tunnel_id"); s.TunnelAnon = G(st, "tunnel_anonymous") == "1";
                 int.TryParse(G(st, "server_pid"), out s.ServerPid); int.TryParse(G(st, "tunnel_pid"), out s.TunnelPid);
                 long.TryParse(G(st, "server_started_unix"), out s.ServerStartedUnix);
             }
@@ -3189,6 +3472,19 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             return s;
         }
 
+        // UI wording: Disconnected / Connecting / Connected / Error
+        static string TunnelLabel(string state, bool hostAlive)
+        {
+            if (!hostAlive) return "Background off";
+            switch (state)
+            {
+                case "Running": return "Connected";
+                case "Starting": case "Preparing": case "Restarting": case "Reconnecting": case "Stopping": return "Connecting";
+                case "Error": return "Error";
+                case "Stopped": return "Disconnected";
+                default: return "Unknown";
+            }
+        }
         void SetBadge(string id, string state, string label) { Badge b; if (B.TryGetValue(id, out b)) b.SetState(state, label); }
 
         void ApplySnapshot(Snapshot s)
@@ -3197,7 +3493,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             snap = s;
             string ss = s.HostAlive ? s.ServerState : "Unknown", ts = s.HostAlive ? s.TunnelState : "Unknown";
             SetBadge("server", ss, s.HostAlive ? ss : "Background off"); SetBadge("server_b", ss, s.HostAlive ? ss : "Background off");
-            SetBadge("tunnel", ts, s.HostAlive ? ts : "Background off"); SetBadge("tunnel_b", ts, s.HostAlive ? ts : "Background off");
+            string tl = TunnelLabel(ts, s.HostAlive); SetBadge("tunnel", ts, tl); SetBadge("tunnel_b", ts, tl);
             SetBadge("host", s.HostAlive ? "Running" : "Unknown", s.HostAlive ? "Installed - running" : "Not running"); SetBadge("host2", s.HostAlive ? "Running" : "Unknown", s.HostAlive ? "Running" : "Not running");
             bool avail = ss == "Running" && ts == "Running" && s.TunnelUrl.Length > 0;
             string endp = !s.HostAlive ? "Unknown" : avail ? "Available" : ss != "Running" ? "Unavailable - server " + ss.ToLowerInvariant() : "Unavailable - tunnel " + ts.ToLowerInvariant();
@@ -3217,8 +3513,14 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             V["spid"].Text = s.ServerPid > 0 ? s.ServerPid.ToString() : "-"; V["sup"].Text = upt; V["sport"].Text = "127.0.0.1:" + port + " (only the local tunnel can reach it)";
             V["sendp"].Text = endp; V["serr"].Text = Help(s.ServerError);
             V["tpid"].Text = s.TunnelPid > 0 ? s.TunnelPid.ToString() : "-"; tbUrl.Text = s.TunnelUrl;
-            int tp = Settings.GetInt("tunnel_port", 0); V["tfwd"].Text = "127.0.0.1:" + (tp > 0 ? tp : port);
-            V["ttok"].Text = File.Exists(Paths.TokenFile) ? "Configured (hidden)" : "NOT SET - the tunnel cannot start"; V["terr"].Text = Help(s.TunnelError);
+            V["tfwd"].Text = "127.0.0.1:" + port + "  (the only port that is forwarded)";
+            V["tid"].Text = s.TunnelId.Length > 0 ? s.TunnelId : "-";
+            V["tauth"].Text = s.TunnelAuth == "ok" ? "Signed in (confirmed)" : s.TunnelAuth == "required" ? "SIGN-IN REQUIRED" : "Not confirmed yet";
+            V["tauth"].ForeColor = s.TunnelAuth == "ok" ? Theme.Good : s.TunnelAuth == "required" ? Theme.Bad : Theme.Warn;
+            V["tacc"].Text = s.TunnelAnon ? "ANONYMOUS - anyone with the link can reach the login page" : "Private - only the Microsoft/GitHub account that signed in";
+            V["tacc"].ForeColor = s.TunnelAnon ? Theme.Bad : Theme.Text;
+            anonBanner.Visible = s.TunnelAnon || Settings.GetBool("tunnel_anonymous");
+            V["terr"].Text = Help(s.TunnelError);
             SetBtn("srvStart", ss == "Stopped" || ss == "Error" || ss == "Unknown"); SetBtn("srvStop", ss != "Stopped" && ss != "Unknown"); SetBtn("srvRestart", ss != "Stopped" && ss != "Unknown");
             SetBtn("tunStart", ts == "Stopped" || ts == "Error" || ts == "Unknown"); SetBtn("tunStop", ts != "Stopped" && ts != "Unknown"); SetBtn("tunRestart", ts != "Stopped" && ts != "Unknown");
 
@@ -3232,6 +3534,103 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         void SetBtn(string id, bool en) { Btn b; if (Bt.TryGetValue(id, out b)) b.Enabled = en; }
     }
 
+    // Modal sign-in helper: runs `devtunnel user login`, shows its real output and reports success only after confirmation
+    internal sealed class LoginForm : Form
+    {
+        readonly bool github, device;
+        readonly RichTextBox rt = new RichTextBox();
+        readonly Label status = new Label();
+        readonly Btn bOpen, bCancel;
+        Process proc; volatile bool cancelled, finished; string firstUrl;
+        public bool Confirmed;
+
+        public LoginForm(bool github, bool device)
+        {
+            this.github = github; this.device = device;
+            Text = "Dev Tunnels sign-in (" + (github ? "GitHub" : "Microsoft") + ")";
+            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
+            AutoScaleDimensions = new SizeF(96F, 96F); AutoScaleMode = AutoScaleMode.Dpi; ClientSize = new Size(640, 420);
+            BackColor = Theme.Card; ForeColor = Theme.Text; Font = UI.F(9.5f, false);
+            status.Left = 20; status.Top = 16; status.Width = 600; status.Height = 64; status.ForeColor = Theme.Text;
+            rt.Left = 20; rt.Top = 88; rt.Width = 600; rt.Height = 250; rt.ReadOnly = true; rt.BorderStyle = BorderStyle.None; rt.BackColor = Theme.Input; rt.ForeColor = Theme.Text; rt.Font = new Font("Consolas", 9f);
+            bOpen = new Btn("Open sign-in page", 0) { Left = 20, Top = 356, AutoSize = false, Size = new Size(170, 36), Enabled = false };
+            bCancel = new Btn("Cancel", 2) { Left = 500, Top = 356, AutoSize = false, Size = new Size(120, 36) };
+            bOpen.Click += delegate { try { if (firstUrl != null) Process.Start(firstUrl); } catch { } };
+            bCancel.Click += delegate { if (finished) Close(); else { cancelled = true; try { if (proc != null && !proc.HasExited) ProcTools.KillTree(proc.Id); } catch { } } };
+            Controls.AddRange(new Control[] { status, rt, bOpen, bCancel });
+            Shown += delegate { Begin(); };
+        }
+
+        static bool Trusted(string url)
+        {
+            Uri u; if (!Uri.TryCreate(url, UriKind.Absolute, out u) || u.Scheme != "https") return false;
+            string h = u.Host.ToLowerInvariant();
+            foreach (string suf in new[] { "microsoft.com", "microsoftonline.com", "live.com", "github.com" }) if (h == suf || h.EndsWith("." + suf)) return true;
+            return false;
+        }
+
+        void Begin()
+        {
+            status.Text = device ? "Follow the instructions below (device code). When you finish in the browser, this window continues by itself."
+                                 : "A browser window opens so you can sign in. Finish there; this window waits until devtunnel confirms it. If no browser opens, cancel and tick 'Use device code'.";
+            var psi = new ProcessStartInfo(DevTunnelCli.Exe, "user login" + (github ? " -g" : "") + (device ? " -d" : ""))
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8, WorkingDirectory = Paths.ToolsDir
+            };
+            Log.Info("Application", "Dev Tunnels sign-in started (" + (github ? "GitHub" : "Microsoft") + (device ? ", device code" : "") + ")");
+            try { proc = Process.Start(psi); }
+            catch (Exception ex) { Finish("Could not start devtunnel: " + ex.Message, false); return; }
+            proc.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) OnLine(e.Data); };
+            proc.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) OnLine(e.Data); };
+            proc.BeginOutputReadLine(); proc.BeginErrorReadLine();
+            var th = new Thread(delegate()
+            {
+                bool exited = proc.WaitForExit(600000);
+                if (!exited) ProcTools.KillTree(proc.Id);
+                proc.WaitForExit();
+                int code = proc.ExitCode; string line = ""; DtAuth a = DtAuth.Unknown;
+                if (exited && !cancelled && code == 0) a = DevTunnelCli.UserShow(out line);
+                string msg; bool ok = false;
+                if (cancelled) msg = "Sign-in cancelled. Nothing was changed.";
+                else if (!exited) msg = "Sign-in timed out after 10 minutes. Nothing was changed.";
+                else if (code != 0) msg = "devtunnel exited with code " + code + ": the sign-in was NOT completed. See the output below.";
+                else if (a == DtAuth.SignedIn) { ok = true; msg = "Signed in. Confirmed by 'devtunnel user show': " + line; }
+                else msg = "devtunnel finished the sign-in command successfully, but 'devtunnel user show' did not confirm it (it said: " + line + "). Press Start Tunnel to find out for sure.";
+                try { BeginInvoke(new Action(delegate { Finish(msg, ok); })); } catch { }
+            });
+            th.IsBackground = true; th.Start();
+        }
+
+        void OnLine(string raw)
+        {
+            string t = Log.Redact(raw);
+            try
+            {
+                BeginInvoke(new Action(delegate
+                {
+                    if (t.Trim().Length == 0) return;
+                    rt.AppendText(t + "\n"); rt.ScrollToCaret();
+                    if (firstUrl == null) { Match m = Regex.Match(t, @"https://[^\s]+"); if (m.Success && Trusted(m.Value)) { firstUrl = m.Value; bOpen.Enabled = true; } }
+                }));
+            }
+            catch { }
+        }
+
+        void Finish(string msg, bool ok)
+        {
+            finished = true; Confirmed = ok; status.Text = msg; status.ForeColor = ok ? Theme.Good : (cancelled ? Theme.Muted : Theme.Warn);
+            bCancel.Text = "Close"; bOpen.Enabled = false;
+            Log.Info("Application", "Dev Tunnels sign-in finished: " + msg);
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!finished) { cancelled = true; try { if (proc != null && !proc.HasExited) ProcTools.KillTree(proc.Id); } catch { } }
+            base.OnFormClosing(e);
+        }
+    }
+
     // ========================================================================
     //  INSTALLER ENGINE (runs inside setup.exe, and inside the --repair copy)
     // ========================================================================
@@ -3239,7 +3638,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
     {
         public string Dir = @"C:\Program Files\PC Watch";
         public int Port = 8765, StartupMode;
-        public string User = "", Password = "", Token = "", Domain = "", LogDir = "";
+        public string User = "", Password = "", LogDir = "";
         public bool DesktopShortcut, Repair;
     }
 
@@ -3288,7 +3687,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                     int pid; string[] a = File.ReadAllText(pf).Trim().Split('|');
                     if (a.Length == 2 && int.TryParse(a[0], out pid))
                     {
-                        string path = ProcTools.PathOf(pid), want = Settings.Get(name == "server" ? "python_path" : "ngrok_path");
+                        string path = ProcTools.PathOf(pid), want = Settings.Get(name == "server" ? "python_path" : "devtunnel_path");
                         if (path != null && ProcTools.SamePath(path, want)) { log("Stopping " + name + " process " + pid); ProcTools.KillTree(pid); }
                     }
                     File.Delete(pf);
@@ -3342,7 +3741,6 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
     {
         public const string PythonVersion = "3.12.8";
         public static string PythonUrl { get { return "https://www.python.org/ftp/python/" + PythonVersion + (Environment.Is64BitOperatingSystem ? "/python-" + PythonVersion + "-amd64.exe" : "/python-" + PythonVersion + ".exe"); } }
-        public static string NgrokUrl { get { return "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-" + (Environment.Is64BitOperatingSystem ? "amd64" : "386") + ".zip"; } }
 
         public static int NetFxRelease()
         {
@@ -3383,25 +3781,13 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             foreach (string c in cands.Distinct()) if (CheckPython(c, out ver)) return c;
             return null;
         }
-        public static bool CheckNgrok(string exe, out string ver)
-        {
-            ver = ""; if (string.IsNullOrEmpty(exe) || !File.Exists(exe)) return false;
-            string o; int c = ProcTools.Run(exe, "version", 20000, out o);
-            var m = Regex.Match(o, @"version\s+(\d+)\.(\d+)\.(\d+)");
-            if (c != 0 || !m.Success || int.Parse(m.Groups[1].Value) < 3) return false;
-            ver = m.Groups[1].Value + "." + m.Groups[2].Value + "." + m.Groups[3].Value; return true;
-        }
-        public static string FindNgrok(out string ver)
-        {
-            ver = "";
-            var cands = new List<string>(); cands.Add(Settings.Get("ngrok_path")); cands.Add(Path.Combine(Paths.ToolsDir, "ngrok.exe"));
-            foreach (string d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';')) { try { if (d.Trim().Length > 0) cands.Add(Path.Combine(d.Trim(), "ngrok.exe")); } catch { } }
-            foreach (string c in cands.Distinct()) if (CheckNgrok(c, out ver)) return c;
-            return null;
-        }
         public static bool Online()
         {
             string t; return Http.Send("GET", "https://www.python.org/", null, null, 10000, false, out t) > 0;
+        }
+        public static bool OnlineMicrosoft()
+        {
+            string t; return Http.Send("GET", "https://aka.ms/", null, null, 10000, false, out t) > 0;
         }
         public static void Download(string url, string dest, Action<int> pct)
         {
@@ -3435,7 +3821,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
     {
         readonly InstallOptions o; readonly Action<int, string> prog; readonly Action<string, string> logf;
         public readonly List<string> Warnings = new List<string>();
-        public string PythonPath = "", NgrokPath = "", PythonVer = "", NgrokVer = "";
+        public string PythonPath = "", DevTunnelPath = "", PythonVer = "", DevTunnelVer = "";
         public InstallEngine(InstallOptions o, Action<int, string> prog, Action<string, string> logf) { this.o = o; this.prog = prog; this.logf = logf; }
         void L(string lvl, string m) { Log.Write(lvl, "Installation", m); logf(lvl, m); }
         void P(int pct, string m) { prog(pct, m); L("INFO", m); }
@@ -3471,7 +3857,8 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
 
             InstallPython();
             InstallServer();
-            InstallNgrok();
+            InstallDevTunnel();
+            RemoveLegacyTunnel();
             Configure();
             Build(csc, src);
             Finalize_();
@@ -3535,31 +3922,29 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             if (Json.Str(caps, "opencv") != "True") W("Camera support (opencv) is not available.");
         }
 
-        void InstallNgrok()
+        void InstallDevTunnel()
         {
-            string ver; string ng = Deps.FindNgrok(out ver);
-            if (ng != null) { P(74, "ngrok " + ver + " found at " + ng + " - not reinstalling."); NgrokPath = ng; NgrokVer = ver; return; }
-            string zip = Path.Combine(Paths.ToolsDir, "ngrok.zip"), exe = Path.Combine(Paths.ToolsDir, "ngrok.exe");
-            P(66, "Downloading ngrok from ngrok.com...");
-            try { Deps.Download(Deps.NgrokUrl, zip, delegate(int p) { prog(66 + p * 8 / 100, "Downloading ngrok... " + p + "%"); }); }
-            catch (Exception ex) { throw new InstallException("ngrok download failed: " + ex.Message, "Check your internet connection, or download ngrok yourself from ngrok.com/download and place ngrok.exe in " + Paths.ToolsDir + ", then run setup again."); }
+            string ver; string dt = DevTunnelSetup.Find(out ver);
+            if (dt != null) { P(74, "Microsoft Dev Tunnels CLI " + ver + " found at " + dt + " - not reinstalling."); DevTunnelPath = dt; DevTunnelVer = ver; return; }
+            P(66, "Downloading the Microsoft Dev Tunnels CLI (official Microsoft download, signature checked)...");
+            DevTunnelPath = DevTunnelSetup.Install(delegate(int p) { prog(66 + p * 8 / 100, "Downloading the Dev Tunnels CLI... " + p + "%"); }, delegate(string m) { L("INFO", m); }, out ver);
+            DevTunnelVer = ver;
+        }
+
+        // Earlier PC Watch versions used a third-party tunnel agent. Remove its program and stored credential so nothing of it is left behind.
+        void RemoveLegacyTunnel()
+        {
+            foreach (string f in new[] { Path.Combine(Paths.ToolsDir, "ngrok.exe"), Path.Combine(Paths.ToolsDir, "ngrok.zip") })
+                try { if (File.Exists(f)) { File.Delete(f); L("INFO", "Removed old tunnel agent file " + f); } } catch (Exception ex) { W("Could not remove old file " + f + ": " + ex.Message); }
             try
             {
-                using (var za = ZipFile.OpenRead(zip))
+                foreach (string f in Directory.GetFiles(Paths.ConfigDir))
                 {
-                    var e = za.Entries.FirstOrDefault(delegate(ZipArchiveEntry x) { return string.Equals(x.Name, "ngrok.exe", StringComparison.OrdinalIgnoreCase); });
-                    if (e == null) throw new InvalidDataException("ngrok.exe is not inside the downloaded archive");
-                    e.ExtractToFile(exe, true);
+                    string n = Path.GetFileName(f).ToLowerInvariant();
+                    if (n.Contains("ngrok") || n.Contains("authtoken")) { File.Delete(f); L("INFO", "Removed old tunnel credential file " + n); }
                 }
             }
-            catch (Exception ex) { throw new InstallException("Could not unpack ngrok: " + ex.Message, "Retry; the download may have been interrupted."); }
-            try { File.Delete(zip); } catch { }
-            string subj, status = Deps.Signature(exe, out subj);
-            L("INFO", "ngrok.exe signature: " + status + " " + subj);
-            if (status == "NotSigned") W("ngrok.exe is not Authenticode-signed; it was verified only by running it and reading its version.");
-            else if (status != "Valid") { try { File.Delete(exe); } catch { } throw new InstallException("ngrok.exe failed signature verification (" + status + ").", "The download may be corrupted or intercepted. Retry on a trusted network."); }
-            if (!Deps.CheckNgrok(exe, out ver)) throw new InstallException("ngrok was downloaded but does not run.", "Check antivirus quarantine for Tools\\ngrok.exe and retry.");
-            NgrokPath = exe; NgrokVer = ver; L("INFO", "ngrok " + ver + " ready");
+            catch (Exception ex) { W("Could not clean up old tunnel credentials: " + ex.Message); }
         }
 
         void Configure()
@@ -3567,13 +3952,12 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             P(76, "Writing configuration and credentials...");
             var d = new Dictionary<string, string>();
             d["server_port"] = o.Port.ToString(); d["startup_mode"] = o.StartupMode.ToString(); d["log_dir"] = string.IsNullOrWhiteSpace(o.LogDir) || ProcTools.SamePath(o.LogDir, Paths.DefaultLogDir) ? "" : o.LogDir;
-            d["python_path"] = PythonPath; d["ngrok_path"] = NgrokPath; d["ngrok_domain"] = o.Domain; d["version"] = Program.Version;
+            d["python_path"] = PythonPath; d["devtunnel_path"] = DevTunnelPath; d["version"] = Program.Version;
             if (!string.IsNullOrEmpty(o.User)) d["remote_user"] = o.User;
             string key = Secrets.RandomHex(32);
             Secrets.Save(Paths.KeyFile, key); d["local_key_sha256"] = Secrets.Sha256Hex(key);
             Settings.Save(d);
-            if (!string.IsNullOrEmpty(o.Token)) { Secrets.Save(Paths.TokenFile, o.Token); Log.AddSecret(o.Token); }
-            if (!File.Exists(Paths.TokenFile)) W("No ngrok authtoken is configured yet: the tunnel cannot start until you set one (Tunnel > Set authtoken).");
+            W("Dev Tunnels needs a one-time sign-in: open the Tunnel page in PC Watch and press Start Tunnel (or Sign in). The tunnel is private to your account by default.");
             if (!string.IsNullOrEmpty(o.Password))
             {
                 string err = AuthTool.Set(o.User, o.Password);
@@ -3622,9 +4006,9 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                 k.SetValue("NoModify", 1, RegistryValueKind.DWord);
             }
             StartupReg.Apply(o.StartupMode);
-            foreach (string must in new[] { exe, Path.Combine(Paths.ServerDir, "server.py"), Path.Combine(Paths.ServerDir, "web.html"), Paths.SettingsFile, PythonPath, NgrokPath })
+            foreach (string must in new[] { exe, Path.Combine(Paths.ServerDir, "server.py"), Path.Combine(Paths.ServerDir, "web.html"), Paths.SettingsFile, PythonPath, DevTunnelPath })
                 if (!File.Exists(must)) throw new InstallException("Final verification failed: missing " + must, "Run setup again (repair).");
-            L("INFO", "Installed. Python " + PythonVer + ", ngrok " + NgrokVer + ", " + Warnings.Count + " warning(s).");
+            L("INFO", "Installed. Python " + PythonVer + ", Dev Tunnels CLI " + DevTunnelVer + ", " + Warnings.Count + " warning(s).");
         }
     }
 
@@ -3637,7 +4021,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         readonly InstallOptions o = new InstallOptions();
         readonly Panel[] pg = new Panel[6]; readonly Label[] stepLbl = new Label[6];
         Label title, lDisk, lExisting, lStatus, lDone, lHint; Btn bBack, bNext, bCancel;
-        TextBox tDir, tUser, tPw, tPw2, tTok, tDom, tLog; NumericUpDown nPort; ComboBox cStart; CheckBox kDesk, kStartNow, kLaunch;
+        TextBox tDir, tUser, tPw, tPw2, tLog; NumericUpDown nPort; ComboBox cStart; CheckBox kDesk, kStartNow, kLaunch;
         ListView lv; ProgressBar bar; RichTextBox rt, rtDone;
         int cur; bool installing, existing, hasAuth, scanOk; InstallEngine engine;
 
@@ -3652,7 +4036,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             if (!string.IsNullOrEmpty(found) && File.Exists(Path.Combine(found, "Config", "settings.ini")))
             {
                 Paths.Init(found); existing = true; o.Repair = true; o.Dir = Paths.InstallDir;
-                o.Port = Settings.GetInt("server_port", 8765); o.StartupMode = Settings.GetInt("startup_mode", 0); o.Domain = Settings.Get("ngrok_domain");
+                o.Port = Settings.GetInt("server_port", 8765); o.StartupMode = Settings.GetInt("startup_mode", 0);
                 o.User = Settings.Get("remote_user"); o.LogDir = Settings.Get("log_dir"); hasAuth = File.Exists(Path.Combine(found, "Config", "auth.json"));
             }
             Text = "PC Watch Setup"; Icon = IconFactory.MakeIcon(Theme.Accent); FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false;
@@ -3689,7 +4073,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         void BuildWelcome()
         {
             var p = pg[0];
-            var t = L(p, "PC Watch lets you monitor and manage this PC remotely through a password-protected web page that is published over an ngrok HTTPS tunnel.\r\n\r\nThis setup will:\r\n   -  reuse or install Python and ngrok (official downloads, signatures checked)\r\n   -  install the PC Watch server\r\n   -  generate PCWatch.exe (the dashboard) on this PC with the Windows C# compiler\r\n   -  create Start Menu shortcuts\r\n\r\nThe dashboard never opens by itself: not after setup, not at Windows startup. You start PCWatch.exe when you want it.\r\n\r\nVersion " + Program.Version, 0, 0, 560, 270);
+            var t = L(p, "PC Watch lets you monitor and manage this PC remotely through a password-protected web page that is published over a Microsoft Dev Tunnels HTTPS tunnel (private to your Microsoft/GitHub account by default).\r\n\r\nThis setup will:\r\n   -  reuse or install Python and the Microsoft Dev Tunnels CLI (official downloads, signatures checked)\r\n   -  install the PC Watch server\r\n   -  generate PCWatch.exe (the dashboard) on this PC with the Windows C# compiler\r\n   -  create Start Menu shortcuts\r\n\r\nThe dashboard never opens by itself: not after setup, not at Windows startup. You start PCWatch.exe when you want it.\r\n\r\nVersion " + Program.Version, 0, 0, 560, 270);
             t.Font = UI.F(10f, false);
             lExisting = L(p, existing ? "An existing installation was found in " + o.Dir + ".\r\nSetup will repair / update it and keep your settings." : "", 0, 290, 560, 60);
             lExisting.ForeColor = Theme.Warn;
@@ -3704,7 +4088,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             br.Click += delegate { using (var f = new FolderBrowserDialog()) if (f.ShowDialog(this) == DialogResult.OK) tDir.Text = Path.Combine(f.SelectedPath, "PC Watch"); };
             p.Controls.Add(br);
             lDisk = L(p, "", 0, 76, 560, 48);
-            L(p, "Required: about 450 MB (Python 100 MB, packages 200 MB, ngrok 30 MB, PC Watch).\r\nOnly PC Watch's own subfolders are created: Server, Tools, Runtime, Config, Logs, Source.", 0, 130, 560, 70).ForeColor = Theme.Muted;
+            L(p, "Required: about 450 MB (Python 100 MB, packages 200 MB, Dev Tunnels CLI 60 MB, PC Watch).\r\nOnly PC Watch's own subfolders are created: Server, Tools, Runtime, Config, Logs, Source.", 0, 130, 560, 70).ForeColor = Theme.Muted;
             if (existing) tDir.ReadOnly = true;
             UpdateDisk();
         }
@@ -3751,11 +4135,11 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                 string pv; string py = Deps.FindPython(out pv);
                 add("Python 3.9+", py != null ? "Found " + pv : "Not found", py != null ? "Reuse (no reinstall)" : "Download " + Deps.PythonVersion, false);
                 add("Python packages", "psutil, mss, Pillow, opencv", "Install into Server\\lib", false);
-                string nv; string ng = Deps.FindNgrok(out nv);
-                add("ngrok agent v3", ng != null ? "Found " + nv : "Not found", ng != null ? "Reuse (no reinstall)" : "Download from ngrok.com", false);
-                if (py == null || ng == null) { bool on = Deps.Online(); add("Internet access", on ? "Reachable" : "UNREACHABLE", on ? "none" : "Connect to the internet", !on); }
+                string nv; string ng = DevTunnelSetup.Find(out nv);
+                add("Microsoft Dev Tunnels CLI", ng != null ? "Found " + nv : "Not found", ng != null ? "Reuse (no reinstall)" : "Download from Microsoft (aka.ms)", false);
+                if (py == null || ng == null) { bool on = (py != null || Deps.Online()) && (ng != null || Deps.OnlineMicrosoft()); add("Internet access", on ? "Reachable" : "UNREACHABLE", on ? "none" : "Connect to the internet", !on); }
                 else add("Internet access", "Not needed", "none", false);
-                add("Networking", "Loopback only + ngrok HTTPS", "No firewall rule needed", false);
+                add("Networking", "Loopback only + Dev Tunnels HTTPS", "No firewall rule needed", false);
                 Ui(delegate { scanOk = !bad; bNext.Enabled = scanOk; lHint.Text = bad ? "Fix the items in red, then press 'Scan again'." : "All set. Press Next."; lHint.ForeColor = bad ? Theme.Bad : Theme.Good; });
             });
             th.IsBackground = true; th.Start();
@@ -3768,14 +4152,12 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             L(p, "Remote username", 0, y + 4, 200, 24); tUser = T(p, 210, y, 340, false); tUser.Text = o.User; y += step;
             L(p, existing && hasAuth ? "New password (blank = keep)" : "Remote password", 0, y + 4, 200, 24); tPw = T(p, 210, y, 340, true); y += step;
             L(p, "Confirm password", 0, y + 4, 200, 24); tPw2 = T(p, 210, y, 340, true); y += step;
-            L(p, "ngrok authtoken", 0, y + 4, 200, 24); tTok = T(p, 210, y, 340, true); y += step;
-            L(p, "ngrok domain (optional)", 0, y + 4, 200, 24); tDom = T(p, 210, y, 340, false); tDom.Text = o.Domain; y += step;
             L(p, "Windows startup", 0, y + 4, 200, 24);
             cStart = new ComboBox { Left = 210, Top = y, Width = 340, DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, BackColor = Theme.Input, ForeColor = Theme.Text };
             cStart.Items.AddRange(new object[] { "Disabled", "Start server at Windows startup", "Start server and tunnel at Windows startup" }); cStart.SelectedIndex = Math.Max(0, Math.Min(2, o.StartupMode)); p.Controls.Add(cStart); y += step;
             L(p, "Log folder (blank = default)", 0, y + 4, 200, 24); tLog = T(p, 210, y, 340, false); tLog.Text = o.LogDir; y += step;
             kDesk = new CheckBox { Text = "Create a desktop shortcut", Left = 0, Top = y, Width = 400, ForeColor = Theme.Text, Checked = false }; p.Controls.Add(kDesk); y += 30;
-            var h = L(p, "Password: 12+ characters with lowercase, uppercase, a digit and a symbol. The authtoken is stored encrypted (Windows DPAPI). Get it at dashboard.ngrok.com > Your Authtoken. Windows startup only starts the hidden background component, never the dashboard.", 0, y, 570, 70);
+            var h = L(p, "Password: 12+ characters with lowercase, uppercase, a digit and a symbol. The Dev Tunnels sign-in is done later on the Tunnel page (devtunnel keeps it in the Windows credential store; PC Watch never stores it). Windows startup only starts the hidden background component, never the dashboard.", 0, y, 570, 70);
             h.ForeColor = Theme.Muted;
         }
 
@@ -3791,15 +4173,9 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                 pe = Policy.CheckPassword(tPw.Text, u); if (pe == null && tPw.Text != tPw2.Text) pe = "The two passwords do not match.";
                 if (pe != null) { Warn(pe); return false; }
             }
-            string tok = tTok.Text.Trim();
-            if (tok.Length > 0 && (tok.Length < 20 || !Regex.IsMatch(tok, @"^[A-Za-z0-9_]+$"))) { Warn("That does not look like an ngrok authtoken."); return false; }
-            if (tok.Length == 0 && !(existing && File.Exists(Paths.TokenFile)))
-                if (MessageBox.Show(this, "No ngrok authtoken entered. Without it the tunnel cannot start (you can add it later in the dashboard).\r\n\r\nContinue without a token?", "PC Watch Setup", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return false;
-            string dom = tDom.Text.Trim();
-            if (dom.Length > 0 && !Regex.IsMatch(dom, @"^[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}$")) { Warn("The ngrok domain must look like name.ngrok-free.app."); return false; }
             string ld = tLog.Text.Trim();
             if (ld.Length > 0) { try { if (!Path.IsPathRooted(ld)) throw new ArgumentException("use a full path such as D:\\Logs"); Path.GetFullPath(ld); } catch (Exception ex) { Warn("Invalid log folder: " + ex.Message); return false; } }
-            o.Port = port; o.User = u; o.Password = needPw ? tPw.Text : ""; o.Token = tok; o.Domain = dom; o.StartupMode = cStart.SelectedIndex; o.LogDir = ld; o.DesktopShortcut = kDesk.Checked;
+            o.Port = port; o.User = u; o.Password = needPw ? tPw.Text : ""; o.StartupMode = cStart.SelectedIndex; o.LogDir = ld; o.DesktopShortcut = kDesk.Checked;
             return true;
         }
         void Warn(string m) { MessageBox.Show(this, m, "PC Watch Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
@@ -3854,7 +4230,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             lDone = L(p, "", 0, 0, 570, 34); lDone.Font = UI.F(13f, true);
             rtDone = new RichTextBox { Left = 0, Top = 44, Width = 570, Height = 260, ReadOnly = true, BorderStyle = BorderStyle.None, BackColor = Theme.Input, ForeColor = Theme.Text, Font = UI.F(9.5f, false) };
             p.Controls.Add(rtDone);
-            kStartNow = new CheckBox { Text = "Start the PC Watch background component now (server + tunnel, no window)", Left = 0, Top = 320, Width = 570, ForeColor = Theme.Text };
+            kStartNow = new CheckBox { Text = "Start the PC Watch background component now (server; start the tunnel from the dashboard after signing in)", Left = 0, Top = 320, Width = 570, ForeColor = Theme.Text };
             kLaunch = new CheckBox { Text = "Open the PC Watch dashboard now (otherwise start it later from the Start menu)", Left = 0, Top = 352, Width = 570, ForeColor = Theme.Text };
             p.Controls.Add(kStartNow); p.Controls.Add(kLaunch);
         }
@@ -3899,7 +4275,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             sb.AppendLine("Installed in: " + Paths.InstallDir);
             sb.AppendLine("PCWatch.exe was generated from PCWatch.cs and passed its self-test.");
             sb.AppendLine("Python " + engine.PythonVer + " : " + engine.PythonPath);
-            sb.AppendLine("ngrok " + engine.NgrokVer + " : " + engine.NgrokPath);
+            sb.AppendLine("Dev Tunnels CLI " + engine.DevTunnelVer + " : " + engine.DevTunnelPath);
             sb.AppendLine("Server port: " + o.Port + "   Remote user: " + o.User);
             sb.AppendLine("Start Menu: PC Watch (dashboard) and Uninstall PC Watch." + (o.DesktopShortcut ? " Desktop shortcut created." : ""));
             sb.AppendLine("Windows startup: " + (o.StartupMode == 0 ? "disabled" : o.StartupMode == 1 ? "server only (hidden, no dashboard)" : "server + tunnel (hidden, no dashboard)"));
@@ -3914,7 +4290,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             {
                 if (kStartNow.Checked)
                 {
-                    Desired.Set("server", "1", "tunnel", File.Exists(Paths.TokenFile) ? "1" : "0", "restart_server", DateTime.UtcNow.Ticks.ToString());
+                    Desired.Set("server", "1", "tunnel", "0", "restart_server", DateTime.UtcNow.Ticks.ToString());
                     Process.Start("explorer.exe", "\"" + Path.Combine(Paths.InstallDir, "PC Watch Background.lnk") + "\"");   // via Explorer so it runs without admin rights
                 }
                 if (kLaunch.Checked) Process.Start("explorer.exe", "\"" + Path.Combine(Shortcut.StartMenuDir, "PC Watch.lnk") + "\"");
