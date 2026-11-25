@@ -1301,33 +1301,10 @@ namespace PCWatch
         }
     }
 
-    // Always-on-top red banner shown while a remote screen/camera session is active
-    internal sealed class SessionBanner : Form
-    {
-        readonly Label lbl = new Label();
-        public Action OnStop;
-        public SessionBanner()
-        {
-            FormBorderStyle = FormBorderStyle.None; ShowInTaskbar = false; TopMost = true; StartPosition = FormStartPosition.Manual;
-            BackColor = Color.FromArgb(190, 30, 45); Size = new Size(470, 46);
-            lbl.ForeColor = Color.White; lbl.Font = new Font("Segoe UI", 10.5f, FontStyle.Bold); lbl.AutoSize = false;
-            lbl.Location = new Point(12, 0); lbl.Size = new Size(350, 46); lbl.TextAlign = ContentAlignment.MiddleLeft;
-            var b = new Button { Text = "STOP", FlatStyle = FlatStyle.Flat, BackColor = Color.White, ForeColor = Color.FromArgb(190, 30, 45), Location = new Point(372, 8), Size = new Size(86, 30), Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
-            b.FlatAppearance.BorderSize = 0;
-            b.Click += delegate { if (OnStop != null) OnStop(); };
-            Controls.Add(lbl); Controls.Add(b);
-            var wa = Screen.PrimaryScreen.WorkingArea; Location = new Point(wa.Right - Width - 12, wa.Top + 12);
-        }
-        protected override bool ShowWithoutActivation { get { return true; } }
-        protected override CreateParams CreateParams { get { var cp = base.CreateParams; cp.ExStyle |= 0x08000000 | 0x80; return cp; } }
-        public void SetText(string t) { lbl.Text = "\u25CF " + t; }
-    }
-
     internal sealed class HostContext : ApplicationContext
     {
         readonly Supervisor sup = new Supervisor();
         readonly NotifyIcon ni = new NotifyIcon();
-        readonly SessionBanner banner = new SessionBanner();
         readonly WinTimer timer = new WinTimer();
         readonly ToolStripMenuItem miServer = new ToolStripMenuItem(), miTunnel = new ToolStripMenuItem();
         readonly Icon iconOk = IconFactory.MakeIcon(Color.FromArgb(79, 140, 255)), iconRec = IconFactory.MakeIcon(Color.FromArgb(200, 30, 45));
@@ -1335,8 +1312,6 @@ namespace PCWatch
 
         public HostContext()
         {
-            var h = banner.Handle;   // force handle creation so BeginInvoke works from worker threads
-            banner.OnStop = delegate { ThreadPool.QueueUserWorkItem(delegate { LocalApi.Post("/api/local/session/stop", "{\"type\":\"all\"}"); }); };
             var menu = new ContextMenuStrip();
             var head = new ToolStripMenuItem("PC Watch is installed and running") { Enabled = false };
             var open = new ToolStripMenuItem("Open dashboard"); open.Click += delegate { OpenDashboard(); };
@@ -1361,9 +1336,9 @@ namespace PCWatch
                     int idx = WaitHandle.WaitAny(new WaitHandle[] { balloonEv, exitEv }, 1000);
                     if (exiting) break;
                     if (idx == 0)
-                        try { banner.BeginInvoke(new Action(delegate { ni.ShowBalloonTip(4000, "PC Watch", "PC Watch is installed and running in the background. Server and tunnel keep running.", ToolTipIcon.Info); })); } catch { }
+                        try { ni.ShowBalloonTip(4000, "PC Watch", "PC Watch is installed and running in the background. Server and tunnel keep running.", ToolTipIcon.Info); } catch { }
                     else if (idx == 1)
-                        try { banner.BeginInvoke(new Action(delegate { ExitNow(); })); } catch { }
+                        try { ExitNow(); } catch { }
                 }
             });
             t.IsBackground = true; t.Start();
@@ -1396,7 +1371,7 @@ namespace PCWatch
                     }
                 }
                 catch { }
-                try { banner.BeginInvoke(new Action(delegate { ApplySessions(scr, cam); polling = false; })); } catch { polling = false; }
+                try { ApplySessions(scr, cam); polling = false; } catch { polling = false; }
             });
         }
 
@@ -1405,12 +1380,10 @@ namespace PCWatch
             bool any = scr || cam;
             if (any)
             {
-                banner.SetText((scr ? "SCREEN SHARING ACTIVE" : "") + (scr && cam ? "  |  " : "") + (cam ? "CAMERA ACTIVE" : ""));
-                if (!banner.Visible) banner.Show();
                 if (!wasActive) ni.ShowBalloonTip(6000, "PC Watch", "A remote " + (scr ? "screen sharing" : "camera") + " session has started.", ToolTipIcon.Warning);
                 ni.Icon = iconRec;
             }
-            else { if (banner.Visible) banner.Hide(); ni.Icon = iconOk; }
+            else { ni.Icon = iconOk; }
             wasActive = any;
         }
 
@@ -1428,7 +1401,7 @@ namespace PCWatch
             ThreadPool.QueueUserWorkItem(delegate
             {
                 sup.Shutdown();
-                try { banner.BeginInvoke(new Action(delegate { ni.Visible = false; ni.Dispose(); ExitThread(); })); } catch { Environment.Exit(0); }
+                try { ni.Visible = false; ni.Dispose(); ExitThread(); } catch { Environment.Exit(0); }
             });
         }
     }
