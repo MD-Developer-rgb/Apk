@@ -4128,7 +4128,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             Paths.Init(o.Dir); lv.Items.Clear(); scanOk = false; bNext.Enabled = false; lHint.Text = "Scanning...";
             var th = new Thread(delegate()
             {
-                bool bad = false;
+                bool bad = false, shown = false;
                 Action<string, string, string, bool> add = delegate(string c, string s, string a, bool block)
                 {
                     if (block) bad = true;
@@ -4141,6 +4141,12 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                     {
                         try { Log.Error("Installation", "Scan step '" + what + "' failed: " + ex); } catch { }
                         add(what, "CHECK FAILED: " + ex.GetType().Name + ": " + ex.Message, "See the Installation log", true);
+                        if (!shown)
+                        {
+                            shown = true; string full = ex.ToString();
+                            try { File.WriteAllText(Path.Combine(Path.GetTempPath(), "PCWatch-scan-error.txt"), full); } catch { }
+                            Ui(delegate { MessageBox.Show(this, "A dependency check failed. Press Ctrl+C to copy this text and send it:\r\n\r\n" + full + "\r\n\r\n(also saved to " + Path.Combine(Path.GetTempPath(), "PCWatch-scan-error.txt") + ")", "PC Watch Setup", MessageBoxButtons.OK, MessageBoxIcon.Warning); });
+                        }
                     }
                 };
                 int rel = 0; string csc = null, pv = "", py = null, nv = "", ng = null;
