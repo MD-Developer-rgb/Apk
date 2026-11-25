@@ -70,6 +70,13 @@ namespace PCWatch
             string a0 = args.Length > 0 ? args[0].ToLowerInvariant() : "";
             if (a0 == "--selftest") return 42;   // used by setup.exe to verify the generated PCWatch.exe runs
             try { ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; } catch { } // TLS 1.2
+            AppDomain.CurrentDomain.UnhandledException += delegate(object sender, UnhandledExceptionEventArgs ue)
+            {
+                string txt = DateTime.Now.ToString("s") + "  " + ue.ExceptionObject;
+                try { File.AppendAllText(Path.Combine(Path.GetTempPath(), "PCWatch-crash.log"), txt + "\r\n\r\n"); } catch { }
+                try { MessageBox.Show("PC Watch hit an unexpected error and must close.\r\n\r\n" + (ue.ExceptionObject as Exception != null ? ((Exception)ue.ExceptionObject).ToString() : "unknown error") +
+                    "\r\n\r\nThe same text was saved to " + Path.Combine(Path.GetTempPath(), "PCWatch-crash.log"), "PC Watch", MessageBoxButtons.OK, MessageBoxIcon.Error); } catch { }
+            };
             try
             {
                 Native.SetProcessDPIAware();
@@ -4127,18 +4134,39 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                     if (block) bad = true;
                     Ui(delegate { var it = new ListViewItem(new[] { c, s, a }); if (block) it.ForeColor = Theme.Bad; lv.Items.Add(it); });
                 };
-                int rel = Deps.NetFxRelease();
-                add(".NET Framework 4.7.2+", rel >= 461808 ? "Installed" : "MISSING", rel >= 461808 ? "none" : "Install .NET 4.8", rel < 461808);
-                string csc = Deps.Csc(); add("C# compiler (csc.exe)", csc != null ? "Found" : "MISSING", csc != null ? "none" : "Repair .NET", csc == null);
-                string origin = ""; bool srcOk = true; try { SourceProvider.Read(out origin); } catch (Exception) { srcOk = false; }
-                add("PCWatch.cs source", srcOk ? "Available" : "MISSING", srcOk ? "none" : "Rebuild setup.exe", !srcOk);
-                string pv; string py = Deps.FindPython(out pv);
-                add("Python 3.9+", py != null ? "Found " + pv : "Not found", py != null ? "Reuse (no reinstall)" : "Download " + Deps.PythonVersion, false);
-                add("Python packages", "psutil, mss, Pillow, opencv", "Install into Server\\lib", false);
-                string nv; string ng = DevTunnelSetup.Find(out nv);
-                add("Microsoft Dev Tunnels CLI", ng != null ? "Found " + nv : "Not found", ng != null ? "Reuse (no reinstall)" : "Download from Microsoft (aka.ms)", false);
-                if (py == null || ng == null) { bool on = (py != null || Deps.Online()) && (ng != null || Deps.OnlineMicrosoft()); add("Internet access", on ? "Reachable" : "UNREACHABLE", on ? "none" : "Connect to the internet", !on); }
-                else add("Internet access", "Not needed", "none", false);
+                Action<string, Action> guard = delegate(string what, Action work)
+                {
+                    try { work(); }
+                    catch (Exception ex)
+                    {
+                        try { Log.Error("Installation", "Scan step '" + what + "' failed: " + ex); } catch { }
+                        add(what, "CHECK FAILED: " + ex.GetType().Name + ": " + ex.Message, "See the Installation log", true);
+                    }
+                };
+                int rel = 0; string csc = null, pv = "", py = null, nv = "", ng = null;
+                guard(".NET Framework 4.7.2+", delegate { rel = Deps.NetFxRelease(); add(".NET Framework 4.7.2+", rel >= 461808 ? "Installed" : "MISSING", rel >= 461808 ? "none" : "Install .NET 4.8", rel < 461808); });
+                guard("C# compiler (csc.exe)", delegate { csc = Deps.Csc(); add("C# compiler (csc.exe)", csc != null ? "Found" : "MISSING", csc != null ? "none" : "Repair .NET", csc == null); });
+                guard("PCWatch.cs source", delegate
+                {
+                    string origin = ""; bool srcOk = true; try { SourceProvider.Read(out origin); } catch (Exception) { srcOk = false; }
+                    add("PCWatch.cs source", srcOk ? "Available" : "MISSING", srcOk ? "none" : "Rebuild setup.exe", !srcOk);
+                });
+                guard("Python 3.9+", delegate
+                {
+                    py = Deps.FindPython(out pv);
+                    add("Python 3.9+", py != null ? "Found " + pv : "Not found", py != null ? "Reuse (no reinstall)" : "Download " + Deps.PythonVersion, false);
+                    add("Python packages", "psutil, mss, Pillow, opencv", "Install into Server\\lib", false);
+                });
+                guard("Microsoft Dev Tunnels CLI", delegate
+                {
+                    ng = DevTunnelSetup.Find(out nv);
+                    add("Microsoft Dev Tunnels CLI", ng != null ? "Found " + nv : "Not found", ng != null ? "Reuse (no reinstall)" : "Download from Microsoft (aka.ms)", false);
+                });
+                guard("Internet access", delegate
+                {
+                    if (py == null || ng == null) { bool on = (py != null || Deps.Online()) && (ng != null || Deps.OnlineMicrosoft()); add("Internet access", on ? "Reachable" : "UNREACHABLE", on ? "none" : "Connect to the internet", !on); }
+                    else add("Internet access", "Not needed", "none", false);
+                });
                 add("Networking", "Loopback only + Dev Tunnels HTTPS", "No firewall rule needed", false);
                 Ui(delegate { scanOk = !bad; bNext.Enabled = scanOk; lHint.Text = bad ? "Fix the items in red, then press 'Scan again'." : "All set. Press Next."; lHint.ForeColor = bad ? Theme.Bad : Theme.Good; });
             });
