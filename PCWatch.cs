@@ -136,7 +136,7 @@ namespace PCWatch
             try
             {
                 if (!File.Exists(path)) return d;
-                foreach (string raw in ReadText(path).Split('\n'))
+                foreach (string raw in ReadText(path).Split(new char[] { '\n' }))
                 {
                     string line = raw.Trim();
                     if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
@@ -537,7 +537,7 @@ namespace PCWatch
         public static List<Process> InDir(string dir)
         {
             var res = new List<Process>();
-            string prefix = Path.GetFullPath(dir).TrimEnd('\\') + "\\";
+            string prefix = Path.GetFullPath(dir).TrimEnd(new char[] { '\\' }) + "\\";
             int me = Process.GetCurrentProcess().Id;
             foreach (Process p in Process.GetProcesses())
             {
@@ -784,7 +784,7 @@ namespace PCWatch
             try
             {
                 if (!File.Exists(PidFile)) return false;
-                string[] a = File.ReadAllText(PidFile).Trim().Split('|'); int pid; long ticks;
+                string[] a = File.ReadAllText(PidFile).Trim().Split(new char[] { '|' }); int pid; long ticks;
                 if (a.Length != 2 || !int.TryParse(a[0], out pid) || !long.TryParse(a[1], out ticks)) { File.Delete(PidFile); return false; }
                 Process p = ProcTools.Get(pid);
                 if (p == null || !ProcTools.SamePath(ProcTools.PathOf(pid), ExpectedExe) ||
@@ -935,7 +935,7 @@ namespace PCWatch
 
         public static string FirstLine(string o)
         {
-            foreach (string l in (o ?? "").Split('\n')) { string t = l.Trim(); if (t.Length > 0) return t.Length > 200 ? t.Substring(0, 200) : t; }
+            foreach (string l in (o ?? "").Split(new char[] { '\n' })) { string t = l.Trim(); if (t.Length > 0) return t.Length > 200 ? t.Substring(0, 200) : t; }
             return "";
         }
         // Microsoft documents `devtunnel user show` but not its wording. Result is SignedIn only when the text clearly
@@ -1151,7 +1151,7 @@ namespace PCWatch
             adoptedNoState = true;
             try
             {
-                string[] a = File.ReadAllText(StateFile).Trim().Split('|');
+                string[] a = File.ReadAllText(StateFile).Trim().Split(new char[] { '|' });
                 if (a.Length == 4 && a[0] == Pid.ToString() && a[1].StartsWith("https://")) { Url = a[1]; TunnelId = a[2]; ready = a[3] == "1"; urlSeenAt = DateTime.UtcNow; adoptedNoState = false; }
             }
             catch { }
@@ -2735,9 +2735,9 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                         using (var sr = new StreamReader(fs, Encoding.UTF8)) text = sr.ReadToEnd();
                         if (start > 0) { int nl = text.IndexOf('\n'); if (nl >= 0) text = text.Substring(nl + 1); }
                     }
-                    foreach (string raw in text.Split('\n'))
+                    foreach (string raw in text.Split(new char[] { '\n' }))
                     {
-                        string line = raw.TrimEnd('\r'); if (line.Length < 25) continue;
+                        string line = raw.TrimEnd(new char[] { '\r' }); if (line.Length < 25) continue;
                         string[] p = line.Split(new[] { '|' }, 4); DateTime t;
                         if (p.Length < 4 || !DateTime.TryParse(p[0], out t)) continue;
                         if (t <= after) continue;
@@ -3691,7 +3691,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
                 {
                     string pf = Path.Combine(dir, "Config", "run", name + ".pid");
                     if (!File.Exists(pf)) continue;
-                    int pid; string[] a = File.ReadAllText(pf).Trim().Split('|');
+                    int pid; string[] a = File.ReadAllText(pf).Trim().Split(new char[] { '|' });
                     if (a.Length == 2 && int.TryParse(a[0], out pid))
                     {
                         string path = ProcTools.PathOf(pid), want = Settings.Get(name == "server" ? "python_path" : "devtunnel_path");
@@ -3774,7 +3774,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             ver = "";
             var cands = new List<string>();
             cands.Add(Settings.Get("python_path")); cands.Add(Path.Combine(Paths.RuntimeDir, "Python", "python.exe"));
-            foreach (string d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';')) { try { if (d.Trim().Length > 0) cands.Add(Path.Combine(d.Trim(), "python.exe")); } catch { } }
+            foreach (string d in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(new char[] { ';' })) { try { if (d.Trim().Length > 0) cands.Add(Path.Combine(d.Trim(), "python.exe")); } catch { } }
             foreach (var hive in new[] { Registry.CurrentUser, Registry.LocalMachine })
             {
                 try
@@ -3819,7 +3819,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
         {
             string o; ProcTools.Run("powershell.exe", "-NoProfile -ExecutionPolicy Bypass -Command \"$s = Get-AuthenticodeSignature -LiteralPath '" + file.Replace("'", "''") +
                 "'; Write-Output ($s.Status.ToString() + '|' + $s.SignerCertificate.Subject)\"", 90000, out o);
-            string line = o.Trim().Split('\n').Last().Trim(); int i = line.IndexOf('|');
+            string line = o.Trim().Split(new char[] { '\n' }).Last().Trim(); int i = line.IndexOf('|');
             subject = i >= 0 ? line.Substring(i + 1) : ""; return i >= 0 ? line.Substring(0, i) : line;
         }
     }
@@ -3922,7 +3922,7 @@ api('/api/session').then(function(j){ csrf = j.csrf; showApp(); }).catch(functio
             P(64, "Checking the server installation...");
             string o1; var env = new Dictionary<string, string>(); env["PYTHONPATH"] = Path.Combine(Paths.ServerDir, "lib");
             int c = ProcTools.Run(PythonPath, "\"" + Path.Combine(Paths.ServerDir, "server.py") + "\" --check --config \"" + Paths.SettingsFile + "\"", 90000, out o1, env, null, Paths.ServerDir);
-            var caps = Json.Obj(o1.Trim().Split('\n').Last().Trim());
+            var caps = Json.Obj(o1.Trim().Split(new char[] { '\n' }).Last().Trim());
             if (c != 0 || caps == null) throw new InstallException("The server self-check failed:\r\n" + o1.Trim(), "Retry the installation; if it persists, run setup again after deleting the Server\\lib folder.");
             if (Json.Str(caps, "psutil") != "True") throw new InstallException("psutil is not importable after installation.", "Retry the installation.");
             if (Json.Str(caps, "mss") != "True" || Json.Str(caps, "pillow") != "True") W("Screen sharing packages are not fully available (mss/Pillow).");
